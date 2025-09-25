@@ -1,0 +1,27 @@
+# venv 폴더
+venv/
+
+# 모델 파일
+*.pth
+*.pkl
+*.pt
+*.model
+nsfw_image_detection/
+
+# 기타 불필요한 파일들
+*.pyc
+__pycache__/
+
+.env
+
+dataset
+
+.DS_Store
+
+# 이미지 파일들 (학습/테스트용)
+*.webp
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
