@@ -37,6 +37,9 @@ rng_state.pth
 dataset/
 data/
 datasets/
+Sentences_50Agree.txt
+Sentences_66Agree.txt
+Sentences_75Agree.txt
 Sentences_AllAgree.txt
 
 # 필요한 텍스트 파일은 제외

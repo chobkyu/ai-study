@@ -8,12 +8,19 @@ print(transformers.__version__)
 
 def finetune_model():
     # 1. 텍스트 파일 읽기
-    file_path = "Sentences_allAgree.txt"
-    with open(file_path, "r", encoding="latin1") as f:
-        sentences = [line.strip() for line in f if line.strip()]
+    file_paths = [
+        "Sentences_50Agree.txt",
+        "Sentences_66Agree.txt",
+        "Sentences_75Agree.txt",
+        "Sentences_allAgree.txt"
+    ]
+    all_sentences = []
+    for path in file_paths:
+        with open(path, "r", encoding="latin1") as f:
+            all_sentences.extend([line.strip() for line in f if line.strip()])
 
     # 2. 데이터프레임 생성
-    df = pd.DataFrame({"text": sentences})
+    df = pd.DataFrame({"text": all_sentences, "label": [0]*len(all_sentences)})
 
     # 3. Dataset 변환 및 train/test split
     dataset = Dataset.from_pandas(df)
