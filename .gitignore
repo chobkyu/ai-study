@@ -1,22 +1,63 @@
-# venv 폴더
+# Python 관련
 venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
 
-# 모델 파일
+# 환경변수 파일
+.env
+.env.local
+.env.*.local
+
+# 모델 파일들
 *.pth
 *.pkl
 *.pt
 *.model
+*.bin
+*.safetensors
+models/
+checkpoints/
 nsfw_image_detection/
 
-# 기타 불필요한 파일들
-*.pyc
-__pycache__/
+# 데이터셋
+dataset/
+data/
+datasets/
 
-.env
+# 로그 파일들
+*.log
+logs/
 
-dataset
+# Jupyter Notebook
+.ipynb_checkpoints/
 
+# IDE 설정
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS 관련
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# 임시 파일들
+*.tmp
+*.temp
+*.cache
 
 # 이미지 파일들 (학습/테스트용)
 *.webp
@@ -25,3 +66,9 @@ dataset
 *.png
 *.gif
 *.bmp
+*.tiff
+*.svg
+
+# GPU 관련
+*.cuda
+*.cubin
