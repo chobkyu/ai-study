@@ -24,12 +24,24 @@ build/
 *.safetensors
 models/
 checkpoints/
+checkpoint-*/
+*-finetuned/
 nsfw_image_detection/
+optimizer.pt
+scheduler.pt
+trainer_state.json
+training_args.bin
+rng_state.pth
 
 # 데이터셋
 dataset/
 data/
 datasets/
+Sentences_AllAgree.txt
+
+# 필요한 텍스트 파일은 제외
+!requirements.txt
+!README.txt
 
 # 로그 파일들
 *.log
