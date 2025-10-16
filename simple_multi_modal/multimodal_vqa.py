@@ -8,7 +8,7 @@ model = BlipForQuestionAnswering.from_pretrained(model_name)
 
 # 테스트 용 이미지와 질문
 image_path = "cat.26.jpg"
-question = "고양이는 어디에 있나요?"
+question = "고양이가 존재하나요?"
 
 # 이미지 로드
 image = Image.open(image_path).convert("RGB")
