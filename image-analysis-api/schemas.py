@@ -11,6 +11,7 @@ class AnalysisCategory(str, Enum):
     SCENE = "scene"              # 장면 이해
     PEOPLE = "people"            # 사람 분석
     EMOTIONS = "emotions"        # 감정 분석
+    RATING = "rating"            # 평가/점수 매기기
 
 class AnalyzeRequest(BaseModel):
     """단일 이미지 분석 요청"""
@@ -61,3 +62,28 @@ class HealthResponse(BaseModel):
     status: str
     model_loaded: bool
     device: str
+
+class RatingRequest(BaseModel):
+    """평가 요청"""
+    rating_type: Optional[str] = Field(
+        default="attractiveness",
+        description="평가 유형: attractiveness(잘생김/예쁨), cuteness(귀여움), coolness(멋짐), style(스타일)"
+    )
+    scale: Optional[int] = Field(
+        default=10,
+        ge=5,
+        le=100,
+        description="평가 척도 (예: 10점 만점, 100점 만점)"
+    )
+    detailed: Optional[bool] = Field(
+        default=True,
+        description="상세 평가 포함 여부"
+    )
+
+class RatingResponse(BaseModel):
+    """평가 결과"""
+    rating_type: str
+    score: str
+    scale: int
+    detailed_feedback: Optional[str] = None
+    processing_time: float

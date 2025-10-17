@@ -11,7 +11,7 @@ from model_manager import ModelManager
 from schemas import (
     AnalyzeRequest, AnalyzeResponse,
     BatchAnalyzeResponse, HealthResponse,
-    AnalysisCategory
+    AnalysisCategory, RatingRequest, RatingResponse
 )
 from utils import (
     validate_image, get_image_hash,
@@ -271,6 +271,78 @@ async def analyze_categories(
     
     except Exception as e:
         logger.error(f"Error analyzing categories: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/rate", response_model=RatingResponse)
+async def rate_image(
+    file: UploadFile = File(..., description="평가할 이미지 파일"),
+    rating_type: Optional[str] = Form("attractiveness", description="평가 유형"),
+    scale: Optional[int] = Form(10, ge=5, le=100, description="평가 척도"),
+    detailed: Optional[bool] = Form(True, description="상세 평가 여부")
+):
+    """
+    이미지 평가 API
+
+    - **file**: 평가할 이미지 파일
+    - **rating_type**: 평가 유형
+      - attractiveness: 잘생김/예쁨
+      - cuteness: 귀여움
+      - coolness: 멋짐/쿨함
+      - style: 스타일/패션
+    - **scale**: 평가 척도 (5~100점)
+    - **detailed**: 상세 평가 포함 여부
+    """
+    start_time = time.time()
+
+    try:
+        # 이미지 읽기
+        image_bytes = await file.read()
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+        # 이미지 검증
+        is_valid, error_msg = validate_image(image)
+        if not is_valid:
+            raise HTTPException(status_code=400, detail=error_msg)
+
+        image = resize_image(image)
+
+        # 평가 유형에 따른 질문 생성
+        rating_questions = {
+            "attractiveness": f"Rate the attractiveness or beauty in this image on a scale of 1 to {scale}. Give a specific score and explain why.",
+            "cuteness": f"Rate how cute the subject in this image is on a scale of 1 to {scale}. Provide a score and reasoning.",
+            "coolness": f"Rate the coolness factor of this image on a scale of 1 to {scale}. Give a score and explain.",
+            "style": f"Rate the style and fashion in this image on a scale of 1 to {scale}. Provide a score and detailed feedback."
+        }
+
+        question = rating_questions.get(
+            rating_type,
+            f"Rate this image on a scale of 1 to {scale}. Give a specific score."
+        )
+
+        if not detailed:
+            question = question.split("Provide")[0].split("Give")[0] + f"Just give me a number from 1 to {scale}."
+
+        # 평가 실행
+        logger.info(f"Rating image: {rating_type} (scale: {scale})")
+        answer = model_manager.analyze_image(
+            image=image,
+            question=question,
+            max_tokens=150 if detailed else 50,
+            temperature=0.3  # 평가는 일관성을 위해 낮은 temperature
+        )
+
+        processing_time = time.time() - start_time
+
+        return RatingResponse(
+            rating_type=rating_type,
+            score=answer,
+            scale=scale,
+            detailed_feedback=answer if detailed else None,
+            processing_time=round(processing_time, 2)
+        )
+
+    except Exception as e:
+        logger.error(f"Error rating image: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/cache/clear")

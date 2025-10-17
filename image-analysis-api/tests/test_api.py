@@ -92,22 +92,82 @@ def test_batch_analyze(image_paths: list):
     
     assert response.status_code == 200
 
+def test_rate_image(image_path: str):
+    """이미지 평가 테스트"""
+    rating_types = ["attractiveness", "cuteness", "coolness", "style"]
+
+    print("\n=== Image Rating Tests ===")
+
+    for rating_type in rating_types:
+        with open(image_path, "rb") as f:
+            files = {"file": f}
+            data = {
+                "rating_type": rating_type,
+                "scale": 10,
+                "detailed": True
+            }
+
+            response = requests.post(
+                f"{BASE_URL}/rate",
+                files=files,
+                data=data
+            )
+
+        if response.status_code == 200:
+            result = response.json()
+            print(f"\n[{rating_type.upper()}] (Scale: {result['scale']})")
+            print(f"Score: {result['score']}")
+            if result['detailed_feedback']:
+                print(f"Feedback: {result['detailed_feedback']}")
+            print(f"Processing Time: {result['processing_time']}s")
+        else:
+            print(f"Error rating {rating_type}: {response.text}")
+
+    assert response.status_code == 200
+
+def test_rate_image_simple(image_path: str):
+    """간단한 점수만 테스트"""
+    with open(image_path, "rb") as f:
+        files = {"file": f}
+        data = {
+            "rating_type": "cuteness",
+            "scale": 100,
+            "detailed": False
+        }
+
+        response = requests.post(
+            f"{BASE_URL}/rate",
+            files=files,
+            data=data
+        )
+
+    print("\n=== Simple Rating (Score Only) ===")
+    result = response.json()
+    print(f"Cuteness Score (out of {result['scale']}): {result['score']}")
+    print(f"Processing Time: {result['processing_time']}s")
+
+    assert response.status_code == 200
+
 if __name__ == "__main__":
     # 테스트 이미지 경로
     image_path = "cat.17.jpg"
-    
+
     if not Path(image_path).exists():
         print(f"Error: {image_path} not found")
         sys.exit(1)
-    
+
     print("Starting API tests...")
-    
+
     # 테스트 실행
     test_health()
     test_analyze_single(image_path)
     test_analyze_categories(image_path)
-    
+
+    # 평가 테스트 추가!
+    test_rate_image(image_path)
+    test_rate_image_simple(image_path)
+
     # 배치 테스트 (이미지 3개 필요)
     # test_batch_analyze([image_path, image_path, image_path])
-    
+
     print("\n✅ All tests passed!")
