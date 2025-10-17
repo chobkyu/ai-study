@@ -87,3 +87,5 @@ Thumbs.db
 # GPU 관련
 *.cuda
 *.cubin
+
+cache
