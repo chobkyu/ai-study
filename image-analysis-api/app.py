@@ -50,7 +50,8 @@ async def startup_event():
     """서버 시작 시 모델 로딩"""
     logger.info("Starting up...")
     try:
-        model_manager.load_model()
+        # 맥북에서는 양자화 끄기 (MPS는 bitsandbytes 미지원)
+        model_manager.load_model(use_quantization=False, use_mps=True)
         logger.info("Server ready!")
     except Exception as e:
         logger.error(f"Failed to load model: {e}")
