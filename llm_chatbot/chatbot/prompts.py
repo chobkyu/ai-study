@@ -1,4 +1,4 @@
-from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 # 시스템 프롬프트
 SYSTEM_PROMPT = """당신은 친절하고 지적인 한국어 AI 어시스턴트입니다.
