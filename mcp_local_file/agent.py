@@ -138,6 +138,28 @@ TOOLS = [
                 "required": ["image_path"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_image_with_llava",
+            "description": "🎯 LLaVA 로컬 모델을 사용해 이미지를 상세하게 분석합니다 (더 정확하고 자세한 분석). GPT Vision 대신 로컬 AI 모델 사용",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "image_path": {
+                        "type": "string",
+                        "description": "분석할 이미지 파일 경로"
+                    },
+                    "question": {
+                        "type": "string",
+                        "description": "이미지에 대해 물어볼 질문",
+                        "default": "이 이미지에 무엇이 보이나요?"
+                    }
+                },
+                "required": ["image_path"]
+            }
+        }
     }
 ]
 
@@ -145,7 +167,11 @@ class FileAgent:
     def __init__(self):
         self.conversation_history = []
         # MCP 서버 도구들을 실제 함수로 매핑
-        from file_server import read_file, list_directory, search_in_files, get_file_info, analyze_image, compare_images, extract_text_from_image
+        from file_server import (
+            read_file, list_directory, search_in_files, get_file_info,
+            analyze_image, compare_images, extract_text_from_image,
+            analyze_image_with_llava  # 🎯 LLaVA API 도구 추가
+        )
         self.tool_functions = {
             "read_file": read_file,
             "list_directory": list_directory,
@@ -153,7 +179,8 @@ class FileAgent:
             "get_file_info": get_file_info,
             "analyze_image": analyze_image,
             "compare_images": compare_images,
-            "extract_text_from_image": extract_text_from_image
+            "extract_text_from_image": extract_text_from_image,
+            "analyze_image_with_llava": analyze_image_with_llava  # 🎯 LLaVA API 도구 추가
         }
     
     def _call_tool(self, function_name: str, function_args: dict) -> str:

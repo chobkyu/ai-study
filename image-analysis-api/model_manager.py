@@ -14,6 +14,7 @@ class ModelManager:
     _model = None
     _processor = None
     _model_id = "llava-hf/llava-1.5-7b-hf"
+    # _model_id = "bczhou/tiny-llava-v1-hf"  # TinyLLaVA는 processor 호환성 이슈 있음
 
     def __new__(cls):
         if cls._instance is None:
@@ -32,6 +33,18 @@ class ModelManager:
 
         # 프로세서 로드
         self._processor = AutoProcessor.from_pretrained(self._model_id)
+
+        # patch_size가 None인 경우 명시적으로 설정
+        if hasattr(self._processor, 'image_processor'):
+            if hasattr(self._processor.image_processor, 'patch_size'):
+                if self._processor.image_processor.patch_size is None:
+                    self._processor.image_processor.patch_size = 14  # LLaVA 기본값
+                    logger.info("Set patch_size to 14 (default)")
+            # size 속성도 확인
+            if hasattr(self._processor.image_processor, 'size'):
+                if self._processor.image_processor.size is None:
+                    self._processor.image_processor.size = {"height": 336, "width": 336}
+                    logger.info("Set image size to 336x336 (default)")
 
         if use_quantization:
             logger.info("Loading with 4-bit quantization...")
@@ -53,10 +66,11 @@ class ModelManager:
             logger.info("4-bit quantized model loaded!")
             logger.info(f" Memory saved")
 
-        else: 
+        else:
             device = "mps" if use_mps and torch.backends.mps.is_available() else "cpu"
             logger.info(f"Using device: {device}")
-            # 모델 로드
+
+            # 모델 로드 (device_map 사용하지 않음 - MPS에서는 지원 안됨)
             self._model = LlavaForConditionalGeneration.from_pretrained(
                 self._model_id,
                 torch_dtype=torch.float16,
@@ -64,7 +78,9 @@ class ModelManager:
             )
 
             if device == "mps":
+                logger.info("Moving model to MPS device...")
                 self._model = self._model.to(device)
+                logger.info(f"Model device after move: {self._model.device}")
 
         # Warm up
         logger.info("Warming up model...")
@@ -75,20 +91,26 @@ class ModelManager:
     
     def _warmup(self):
         """더미 입력으로 모델 준비"""
-        dummy_image = Image.new('RGB', (224,224), color='white')
-        dummy_prompt = "USER: <image>\nDescribe this image.\nASSISTANT:"
+        try:
+            dummy_image = Image.new('RGB', (336, 336), color='white')  # LLaVA 기본 사이즈
+            dummy_prompt = "USER: <image>\nDescribe this image.\nASSISTANT:"
 
-        inputs = self._processor(
-            text=dummy_prompt,
-            images=dummy_image,
-            return_tensors="pt"
-        )
+            inputs = self._processor(
+                text=dummy_prompt,
+                images=dummy_image,
+                return_tensors="pt"
+            )
 
-        if self._model.device.type == "mps":
-            inputs = {k: v.to("mps") for k,v in inputs.items()}
+            # MPS 디바이스로 이동
+            device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
+            inputs = {k: v.to(device) for k, v in inputs.items()}
 
-        with torch.no_grad():
-            self._model.generate(**inputs, max_new_tokens=10)
+            with torch.no_grad():
+                self._model.generate(**inputs, max_new_tokens=10)
+
+            logger.info("Warmup completed successfully!")
+        except Exception as e:
+            logger.warning(f"Warmup failed (non-critical): {e}")
 
     def analyze_image(
             self,
@@ -101,24 +123,32 @@ class ModelManager:
         if self._model is None:
             raise RuntimeError("Model not loaded. Call load_model() first")
 
+        # 이미지를 RGB로 변환하고 적절한 크기로 조정
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+
         prompt = f"USER: <image>\n{question}\nASSISTANT:"
 
+        # padding과 truncation 명시적으로 지정
         inputs = self._processor(
-            text= prompt,
+            text=prompt,
             images=image,
-            return_tensors="pt"
+            return_tensors="pt",
+            padding=True
         )
 
-        # MPS 디바이스로 이동
-        if self._model.device.type == "mps":
-            inputs = {k: v.to("mps") for k,v in inputs.items()}
+        # MPS 디바이스로 이동 (무조건 mps로)
+        device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
+        inputs = {k: v.to(device) for k, v in inputs.items()}
 
         with torch.no_grad():
             output = self._model.generate(
                 **inputs,
                 max_new_tokens=max_tokens,
                 temperature=temperature,
-                do_sample=True if temperature > 0 else False
+                do_sample=True if temperature > 0 else False,
+                num_beams=1,  # beam search 끄기 (속도 향상)
+                use_cache=True  # KV 캐시 사용 (속도 향상)
             )
 
         # decoding
@@ -148,8 +178,9 @@ class ModelManager:
             padding=True
         )
 
-        if self._model.device.type == "mps":
-            inputs = {k: v.to("mps") for k, v in inputs.items()}
+        # MPS 디바이스로 이동 (무조건 mps로)
+        device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
+        inputs = {k: v.to(device) for k, v in inputs.items()}
         
         with torch.no_grad():
             outputs = self._model.generate(

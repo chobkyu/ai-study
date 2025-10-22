@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import List
 from PIL import Image
 import io
+import requests
 
 mcp = FastMCP("Local File Server")
 
@@ -243,8 +244,51 @@ def extract_text_from_image(image_path: str) -> str:
         
     except Exception as e:
         return f"Error extracting text: {str(e)}"
-    
-    
+
+@mcp.tool()
+def analyze_image_with_llava(
+    image_path: str,
+    question: str = "이 이미지에 무엇이 보이나요?"
+) -> str:
+    """
+    LLaVA 모델을 사용해 이미지를 분석합니다 (로컬 API 사용).
+
+    Args:
+        image_path: 분석할 이미지 파일 경로
+        question: 이미지에 대해 물어볼 질문
+
+    Returns:
+        LLaVA 모델의 이미지 분석 결과
+    """
+    try:
+        # image-analysis-api 서버 확인
+        API_URL = "http://localhost:8000/analyze"
+
+        # 이미지 파일 열기
+        with open(image_path, 'rb') as f:
+            files = {'file': f}
+            data = {
+                'question': f"question 영어로 대답하세요!!",
+                'category': 'general',
+                'max_tokens': 150,  # 추론 속도 향상을 위해 토큰 수 감소
+                'temperature':2
+            }
+
+            # API 호출 (LLaVA 모델 로딩 및 분석 시간 고려하여 timeout 증가)
+            response = requests.post(API_URL, files=files, data=data, timeout=1000)
+
+            if response.status_code == 200:
+                result = response.json()
+                print(f"[LLaVA 분석 결과]\n질문: {result['question']}\n답변: {result['answer']}\n처리시간: {result['processing_time']}초")
+                return f"[LLaVA 분석 결과]\n질문: {result['question']}\n답변: {result['answer']}\n처리시간: {result['processing_time']}초"
+            else:
+                return f"API 오류: {response.status_code} - {response.text}"
+
+    except requests.exceptions.ConnectionError:
+        return "❌ image-analysis-api 서버가 실행되지 않았습니다. 먼저 서버를 시작하세요:\ncd /Users/fanding/develop/ppp/image-analysis-api && python app.py"
+    except Exception as e:
+        return f"이미지 분석 실패: {str(e)}"
+
 # Resource 예시 (정적 데이터)
 @mcp.resource("config://workspace")
 def get_workspace_config() -> str:

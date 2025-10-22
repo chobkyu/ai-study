@@ -140,6 +140,8 @@ async def analyze_image(
         
         processing_time = time.time() - start_time
         
+        logger.info(answer)
+
         return AnalyzeResponse(
             question=question,
             answer=answer,
