@@ -271,7 +271,7 @@ def analyze_image_with_llava(
                 'question': f"question 영어로 대답하세요!!",
                 'category': 'general',
                 'max_tokens': 150,  # 추론 속도 향상을 위해 토큰 수 감소
-                'temperature':2
+                'temperature':0.7
             }
 
             # API 호출 (LLaVA 모델 로딩 및 분석 시간 고려하여 timeout 증가)
