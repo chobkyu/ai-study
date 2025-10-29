@@ -1,31 +1,36 @@
 """
-Error Debugger API with AI Agent + FastMCP
-PHP 에러 → FastAPI → AI Agent (OpenAI + FastMCP tools) → 비즈니스 로직 분석
+Error Debugger API with LangGraph
+PHP 에러 → FastAPI → LangGraph Agent → 비즈니스 로직 분석
 """
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Optional, List
+from typing import Optional, List, Annotated, TypedDict
 import os
 import re
-from openai import OpenAI
+from pathlib import Path
 from dotenv import load_dotenv
 import json
+
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langgraph.graph import StateGraph, END
+from langgraph.prebuilt import ToolNode
+from langchain_core.tools import tool
 
 # 환경 변수 로드
 load_dotenv()
 
-# OpenAI 클라이언트 초기화
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# LLM 초기화
+llm = ChatOpenAI(model="gpt-4o", temperature=0.3)
 
 # FastAPI 앱
 app = FastAPI(
-    title="Error Debugger API with AI Agent",
-    description="AI 에이전트가 FastMCP 툴로 여러 파일을 읽으며 비즈니스 로직까지 분석",
-    version="3.0.0"
+    title="Error Debugger API with LangGraph",
+    description="LangGraph로 체계적인 에러 분석",
+    version="4.0.0"
 )
 
-# CORS 설정
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -48,238 +53,304 @@ class ErrorRequest(BaseModel):
     )
 
 
-# ========== Tools for AI Agent ==========
-# OpenAI 에이전트가 사용할 툴들
+# ========== LangChain Tools ==========
 
+@tool
 def read_file(file_path: str) -> str:
-    """
-    파일의 전체 내용을 읽습니다.
-
-    Args:
-        file_path: 읽을 파일의 경로 (절대경로 또는 상대경로)
-
-    Returns:
-        파일 내용
-    """
+    """파일의 전체 내용을 읽습니다."""
     try:
-        # 상대경로를 절대경로로 변환
+        # /home/fanding → /Users/fanding 경로 변환 (macOS)
+        if file_path.startswith('/home/fanding'):
+            file_path = file_path.replace('/home/fanding', '/Users/fanding')
+
         if not os.path.isabs(file_path):
             possible_bases = [
                 "/Users/fanding/develop/legacy-php-api",
                 "/Users/fanding/develop/ppp",
                 os.getcwd()
             ]
-
-            found = False
             for base in possible_bases:
                 full_path = os.path.join(base, file_path)
                 if os.path.exists(full_path):
                     file_path = full_path
-                    found = True
                     break
 
-            if not found:
-                return f"ERROR: 파일을 찾을 수 없습니다: {file_path}"
+        print(f"[DEBUG] read_file: {file_path}, exists={os.path.exists(file_path)}")
 
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
-
-        return content
-
-    except Exception as e:
-        return f"ERROR: 파일 읽기 실패: {str(e)}"
-
-
-def search_files(directory: str, pattern: str = "*.php") -> str:
-    """
-    디렉토리에서 특정 패턴의 파일들을 검색합니다.
-
-    Args:
-        directory: 검색할 디렉토리 경로
-        pattern: 파일 패턴 (예: *.php, *.py, UserController.php)
-
-    Returns:
-        검색된 파일 목록 (JSON 문자열)
-    """
-    try:
-        import glob
-
-        if not os.path.isabs(directory):
-            directory = os.path.abspath(directory)
-
-        search_pattern = os.path.join(directory, "**", pattern)
-        files = glob.glob(search_pattern, recursive=True)
-
-        # 최대 50개로 제한
-        result = files[:50]
-        return json.dumps(result, ensure_ascii=False)
-
-    except Exception as e:
-        return json.dumps([f"ERROR: {str(e)}"], ensure_ascii=False)
-
-
-def grep_code(file_path: str, search_term: str) -> str:
-    """
-    파일에서 특정 코드나 함수를 검색합니다.
-
-    Args:
-        file_path: 검색할 파일 경로
-        search_term: 검색할 코드 (함수명, 클래스명, 변수명 등)
-
-    Returns:
-        검색 결과 (라인 번호와 내용)
-    """
-    try:
-        content = read_file(file_path)
-
-        if content.startswith("ERROR"):
+            print(f"[DEBUG] read_file: 읽은 길이 = {len(content)} bytes")
             return content
-
-        lines = content.split('\n')
-        results = []
-
-        for i, line in enumerate(lines, 1):
-            if search_term.lower() in line.lower():
-                results.append(f"Line {i}: {line.strip()}")
-
-        if not results:
-            return f"'{search_term}'을(를) 찾을 수 없습니다."
-
-        return "\n".join(results[:20])  # 최대 20개
-
     except Exception as e:
         return f"ERROR: {str(e)}"
 
 
-def list_directory(directory: str) -> str:
-    """
-    디렉토리의 파일과 폴더 목록을 반환합니다.
-
-    Args:
-        directory: 조회할 디렉토리 경로
-
-    Returns:
-        파일과 폴더 목록 (JSON 문자열)
-    """
+@tool
+def search_files(directory: str, pattern: str = "*.php") -> str:
+    """디렉토리에서 파일을 검색합니다."""
     try:
+        import glob
         if not os.path.isabs(directory):
             directory = os.path.abspath(directory)
-
-        if not os.path.exists(directory):
-            return json.dumps({"error": f"디렉토리가 존재하지 않습니다: {directory}"})
-
-        items = []
-        for item in os.listdir(directory):
-            item_path = os.path.join(directory, item)
-            items.append({
-                "name": item,
-                "path": item_path,
-                "is_dir": os.path.isdir(item_path)
-            })
-
-        return json.dumps(items, ensure_ascii=False)
-
+        search_pattern = os.path.join(directory, "**", pattern)
+        files = glob.glob(search_pattern, recursive=True)
+        return json.dumps(files[:30], ensure_ascii=False)
     except Exception as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return json.dumps([f"ERROR: {str(e)}"], ensure_ascii=False)
 
 
-# FastMCP 툴들을 OpenAI function calling 형식으로 변환
-def get_openai_tools():
-    """FastMCP 툴들을 OpenAI function calling 형식으로 변환"""
-    return [
-        {
-            "type": "function",
-            "function": {
-                "name": "read_file",
-                "description": "파일의 전체 내용을 읽습니다. 에러가 발생한 파일이나 관련된 다른 파일들을 읽을 때 사용하세요.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "file_path": {
-                            "type": "string",
-                            "description": "읽을 파일의 경로 (절대경로 또는 상대경로)"
-                        }
-                    },
-                    "required": ["file_path"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "search_files",
-                "description": "디렉토리에서 특정 패턴의 파일들을 검색합니다. 관련 파일을 찾을 때 사용하세요.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "directory": {
-                            "type": "string",
-                            "description": "검색할 디렉토리 경로"
-                        },
-                        "pattern": {
-                            "type": "string",
-                            "description": "파일 패턴 (예: *.php, *.py, UserController.php)",
-                            "default": "*.php"
-                        }
-                    },
-                    "required": ["directory"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "grep_code",
-                "description": "파일에서 특정 코드나 함수를 검색합니다. 함수 정의나 클래스를 찾을 때 사용하세요.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "file_path": {
-                            "type": "string",
-                            "description": "검색할 파일 경로"
-                        },
-                        "search_term": {
-                            "type": "string",
-                            "description": "검색할 코드 (함수명, 클래스명, 변수명 등)"
-                        }
-                    },
-                    "required": ["file_path", "search_term"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "list_directory",
-                "description": "디렉토리의 파일과 폴더 목록을 반환합니다. 프로젝트 구조를 파악할 때 사용하세요.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "directory": {
-                            "type": "string",
-                            "description": "조회할 디렉토리 경로"
-                        }
-                    },
-                    "required": ["directory"]
-                }
-            }
-        }
+@tool
+def grep_code(file_path: str, search_term: str) -> str:
+    """파일에서 특정 코드를 검색합니다."""
+    try:
+        # /home/fanding → /Users/fanding 경로 변환 (macOS)
+        if file_path.startswith('/home/fanding'):
+            file_path = file_path.replace('/home/fanding', '/Users/fanding')
+
+        content = read_file.invoke({"file_path": file_path})
+        if content.startswith("ERROR"):
+            return content
+        lines = content.split('\n')
+        results = []
+        for i, line in enumerate(lines, 1):
+            if search_term.lower() in line.lower():
+                results.append(f"Line {i}: {line.strip()}")
+        return "\n".join(results[:15]) if results else f"'{search_term}' 없음"
+    except Exception as e:
+        return f"ERROR: {str(e)}"
+
+
+# ========== LangGraph State ==========
+
+from operator import add
+
+class AgentState(TypedDict):
+    messages: Annotated[list, add]  # add operator로 메시지 누적
+    error_info: dict
+    analysis_result: Optional[str]
+
+
+# ========== LangGraph Nodes ==========
+
+def find_primary_error_file(stack_trace: str, base_paths: list) -> tuple:
+    """스택 트레이스에서 핵심 에러 파일 찾기"""
+    import re
+    exclude = ['/system/', '/vendor/', '/core/', 'CodeIgniter.php', 'index.php', '/bootstrap/']
+
+    for line in stack_trace.split('\n'):
+        match = re.search(r'#\d+\s+([^(]+\.php)\((\d+)\)', line)
+        if match:
+            file_path, line_no = match.groups()
+            if any(p in file_path for p in exclude):
+                continue
+
+            for base in base_paths:
+                for sub in ['', 'application/controllers/rest', 'application/controllers', 'application/models']:
+                    full = Path(base) / sub / Path(file_path).name
+                    if full.exists():
+                        return str(full), line_no
+    return None, None
+
+
+def analyze_node(state: AgentState):
+    """에러 분석 노드"""
+    print("\n🤖 AI 에이전트 분석 중...")
+
+    messages = state["messages"]
+    error_info = state["error_info"]
+
+    # 디버깅: 현재 messages 상태 확인
+    print(f"[DEBUG] Current messages count: {len(messages)}")
+    for i, msg in enumerate(messages):
+        msg_type = type(msg).__name__
+        has_tool_calls = hasattr(msg, 'tool_calls') and msg.tool_calls
+        print(f"  [{i}] {msg_type}, tool_calls={has_tool_calls}")
+
+    # 🔧 경로 변환: /home/fanding → /Users/fanding (macOS 로컬 개발 환경)
+    stack_trace = error_info['stack_trace'].replace('/home/fanding', '/Users/fanding')
+    error_info['stack_trace'] = stack_trace
+
+    # 🎯 핵심 에러 파일 먼저 읽기
+    base_paths = [
+        '/Users/fanding/develop/legacy-php-api',
+        '/Users/fanding/develop/ppp',
+        error_info.get('server_base_path', '')
     ]
 
+    primary_file, error_line = find_primary_error_file(stack_trace, base_paths)
 
-def execute_tool(tool_name: str, arguments: dict) -> str:
-    """툴 실행"""
-    if tool_name == "read_file":
-        return read_file(arguments["file_path"])
-    elif tool_name == "search_files":
-        pattern = arguments.get("pattern", "*.php")
-        return search_files(arguments["directory"], pattern)
-    elif tool_name == "grep_code":
-        return grep_code(arguments["file_path"], arguments["search_term"])
-    elif tool_name == "list_directory":
-        return list_directory(arguments["directory"])
+    context_code = ""
+    if primary_file:
+        print(f"📍 시작점: {primary_file}:{error_line}")
+        try:
+            with open(primary_file, 'r', encoding='utf-8') as f:
+                context_code = f.read()[:5000]
+        except Exception as e:
+            print(f"⚠️  파일 읽기 실패: {e}")
+
+    # 🔑 첫 번째 호출인지 확인
+    is_first_call = len(messages) == 0
+
+    # 시스템 프롬프트
+    if is_first_call:
+        # 첫 번째: 도구 사용 가능
+        system_msg = SystemMessage(content=f"""에러 분석 전문가입니다.
+
+**중요 정보:**
+- 실제 파일 위치: /Users/fanding/develop/legacy-php-api
+- 아래 에러 파일이 이미 제공되었습니다: {primary_file if primary_file else '없음'}
+- 제공된 파일만으로 충분하면 즉시 분석하세요
+
+**형식:**
+## 🔍 위치
+파일:라인 - 함수
+
+## 💥 원인
+핵심 1-2줄
+
+## 🔧 해결
+```code
+수정 코드
+```
+
+**규칙:**
+- 아래 제공된 에러 파일 코드를 우선 분석
+- 정말 필요한 경우만 read_file로 추가 파일 조회 (최대 1-2개)
+- 파일이 없다고 말하지 말고 제공된 코드를 분석하세요
+- 불필요한 도구 호출 금지
+""")
+
+        # 에러 정보
+        content = f"""에러 분석:
+
+타입: {error_info['error_type']}
+메시지: {error_info['error_message']}
+
+스택:
+{error_info['stack_trace']}
+
+파라미터: {error_info.get('input_params', '없음')}
+"""
+
+        if context_code:
+            content += f"""
+
+📄 에러 파일 ({primary_file}:{error_line}):
+```php
+{context_code}
+```
+"""
+
+        error_msg = HumanMessage(content=content)
+
+        llm_with_tools = llm.bind_tools([read_file, search_files, grep_code])
+        response = llm_with_tools.invoke([system_msg, error_msg])
+
     else:
-        return f"ERROR: 알 수 없는 툴: {tool_name}"
+        # 두 번째 이후: 도구 결과를 바탕으로 최종 분석 (도구 없이)
+        prompt_msg = HumanMessage(content="""도구 조회 결과를 바탕으로 최종 에러 분석을 작성하세요.
+
+**형식:**
+## 🔍 위치
+파일:라인 - 함수
+
+## 💥 원인
+핵심 1-2줄
+
+## 🔧 해결
+```code
+수정 코드
+```
+
+**중요: 더 이상 도구를 호출하지 말고, 지금 바로 분석 결과를 작성하세요.**
+""")
+
+        # messages 순서 유지: [AI(tool_calls), ToolMessage, ...]
+        response = llm.invoke(messages + [prompt_msg])
+
+    return {"messages": messages + [response]}
+
+
+def tool_node_wrapper(state: AgentState):
+    """툴 실행 노드"""
+    print(f"🔧 툴 실행 중...")
+
+    messages = state["messages"]
+
+    # 디버깅: 도구 실행 전 messages 확인
+    print(f"[DEBUG] Before tool execution, messages count: {len(messages)}")
+    for i, msg in enumerate(messages):
+        msg_type = type(msg).__name__
+        has_tool_calls = hasattr(msg, 'tool_calls') and msg.tool_calls
+        print(f"  [{i}] {msg_type}, tool_calls={has_tool_calls}")
+
+    tools = [read_file, search_files, grep_code]
+    tool_node = ToolNode(tools)
+    result = tool_node.invoke(state)
+
+    # 디버깅: messages 구조 확인
+    print(f"[DEBUG] After tool execution, result messages count: {len(result.get('messages', []))}")
+    for i, msg in enumerate(result.get('messages', [])):
+        msg_type = type(msg).__name__
+        has_tool_calls = hasattr(msg, 'tool_calls') and msg.tool_calls
+        print(f"  [{i}] {msg_type}, tool_calls={has_tool_calls}")
+
+    return result
+
+
+def should_continue(state: AgentState):
+    """계속할지 결정"""
+    messages = state["messages"]
+    last_message = messages[-1]
+
+    # AI 메시지 카운트 (최대 5번만 반복)
+    ai_count = sum(1 for m in messages if isinstance(m, AIMessage))
+    if ai_count >= 5:
+        print(f"⚠️  최대 반복 횟수 도달 ({ai_count}회), 강제 종료")
+        return "end"
+
+    # 툴 호출이 있으면 계속
+    if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
+        return "tools"
+    return "end"
+
+
+def extract_result(state: AgentState):
+    """최종 결과 추출"""
+    messages = state["messages"]
+
+    # 마지막 AI 메시지 찾기
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage) and msg.content:
+            return {"analysis_result": msg.content}
+
+    return {"analysis_result": "분석 실패"}
+
+
+# ========== LangGraph 생성 ==========
+
+workflow = StateGraph(AgentState)
+
+# 노드 추가
+workflow.add_node("analyze", analyze_node)
+workflow.add_node("tools", tool_node_wrapper)
+workflow.add_node("extract", extract_result)
+
+# 엣지 설정
+workflow.set_entry_point("analyze")
+workflow.add_conditional_edges(
+    "analyze",
+    should_continue,
+    {
+        "tools": "tools",
+        "end": "extract"
+    }
+)
+workflow.add_edge("tools", "analyze")
+workflow.add_edge("extract", END)
+
+# 컴파일
+graph = workflow.compile()
 
 
 # ========== Helper Functions ==========
@@ -288,25 +359,21 @@ def _extract_file_locations(stack_trace: str, base_path: str) -> List[dict]:
     """스택 트레이스에서 파일 위치 정보 추출"""
     locations = []
 
-    # Python 스타일
+    # Python
     python_pattern = r'File\s+"([^"]+)",\s+line\s+(\d+)(?:,\s+in\s+(\w+))?'
-    python_matches = re.findall(python_pattern, stack_trace)
-
-    for match in python_matches:
+    for match in re.findall(python_pattern, stack_trace):
         file_path, line_num, function = match
         if base_path in file_path or os.path.isabs(file_path):
             locations.append({
                 'file': file_path,
                 'line': int(line_num),
-                'function': function if function else None,
+                'function': function or None,
                 'language': 'python'
             })
 
-    # PHP 스타일
+    # PHP
     php_pattern = r'([/\w\-\.]+\.php)[\(:]+(\d+)\)?'
-    php_matches = re.findall(php_pattern, stack_trace)
-
-    for match in php_matches:
+    for match in re.findall(php_pattern, stack_trace):
         file_path, line_num = match
         if base_path in file_path or os.path.isabs(file_path):
             locations.append({
@@ -319,158 +386,6 @@ def _extract_file_locations(stack_trace: str, base_path: str) -> List[dict]:
     return locations
 
 
-async def _analyze_with_ai_agent(
-    error_type: str,
-    error_message: str,
-    stack_trace: str,
-    file_locations: List[dict],
-    input_params: Optional[str] = None,
-    server_base_path: str = "/Users/fanding/develop/legacy-php-api"
-) -> dict:
-    """
-    AI 에이전트가 FastMCP 툴을 사용하며 비즈니스 로직까지 분석합니다.
-    """
-
-    # 초기 컨텍스트
-    initial_context = f"""당신은 전문 소프트웨어 디버거이자 코드 분석가입니다.
-
-## 에러 정보
-- **에러 타입**: {error_type}
-- **에러 메시지**: {error_message}
-
-## 스택 트레이스
-```
-{stack_trace}
-```
-
-## 입력 파라미터
-{input_params if input_params else "없음"}
-
-## 에러 발생 파일들
-{json.dumps(file_locations, indent=2, ensure_ascii=False)}
-
-## 서버 경로
-{server_base_path}
-
-## 당신의 임무
-1. 에러가 발생한 파일을 read_file로 읽어서 분석하세요
-2. 관련된 다른 파일들도 read_file로 읽어서 비즈니스 로직을 파악하세요
-3. 함수 호출 흐름을 추적하세요
-4. 필요하면 search_files로 관련 파일들을 찾으세요
-5. 필요하면 grep_code로 특정 함수나 클래스를 찾으세요
-6. 필요하면 list_directory로 프로젝트 구조를 파악하세요
-
-## 분석 결과 형식
-최종적으로 다음 형식으로 분석 결과를 제공하세요:
-
-### 🔍 에러 분석
-
-#### 1. 에러 발생 위치와 원인
-- 정확히 어디서 왜 에러가 발생했는지
-
-#### 2. 비즈니스 로직 분석
-- 에러가 발생한 코드의 비즈니스 목적
-- 어떤 흐름으로 이 코드가 실행되었는지
-- 관련된 다른 파일/함수들의 역할
-
-#### 3. 근본 원인 (Root Cause)
-- 단순히 코드 에러가 아니라, 왜 이런 상황이 발생했는지
-
-#### 4. 해결 방법
-- 구체적인 수정 방법 (코드 예시 포함)
-- 비즈니스 로직을 고려한 해결 방안
-
-#### 5. 예방 방법
-- 이런 에러를 미리 방지하는 방법
-
-**중요**: 반드시 FastMCP 툴들(read_file, search_files, grep_code, list_directory)을 적극 활용하세요!
-"""
-
-    messages = [
-        {"role": "system", "content": "당신은 FastMCP 툴을 사용할 수 있는 전문 디버거입니다. 여러 파일을 읽으며 비즈니스 로직까지 깊이 분석합니다."},
-        {"role": "user", "content": initial_context}
-    ]
-
-    tool_calls_history = []
-    max_iterations = 15  # 최대 15번의 툴 호출
-
-    for iteration in range(max_iterations):
-        try:
-            # OpenAI API 호출
-            response = openai_client.chat.completions.create(
-                model="gpt-4o",
-                messages=messages,
-                tools=get_openai_tools(),
-                tool_choice="auto",
-                temperature=0.3,
-                max_tokens=4000
-            )
-
-            assistant_message = response.choices[0].message
-
-            # 툴 호출이 없으면 최종 답변
-            if not assistant_message.tool_calls:
-                return {
-                    "analysis": assistant_message.content,
-                    "tool_calls": tool_calls_history,
-                    "iterations": iteration + 1
-                }
-
-            # 툴 호출 실행
-            messages.append({
-                "role": "assistant",
-                "content": assistant_message.content,
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments
-                        }
-                    }
-                    for tc in assistant_message.tool_calls
-                ]
-            })
-
-            for tool_call in assistant_message.tool_calls:
-                function_name = tool_call.function.name
-                function_args = json.loads(tool_call.function.arguments)
-
-                # 툴 실행
-                tool_result = execute_tool(function_name, function_args)
-
-                # 히스토리 저장
-                tool_calls_history.append({
-                    "tool": function_name,
-                    "arguments": function_args,
-                    "result_preview": tool_result[:200] + "..." if len(tool_result) > 200 else tool_result
-                })
-
-                # 결과를 메시지에 추가
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "name": function_name,
-                    "content": tool_result
-                })
-
-        except Exception as e:
-            return {
-                "analysis": f"AI 에이전트 분석 중 에러 발생: {str(e)}",
-                "tool_calls": tool_calls_history,
-                "iterations": iteration + 1,
-                "error": str(e)
-            }
-
-    # 최대 반복 도달
-    return {
-        "analysis": "최대 반복 횟수에 도달했습니다. 부분 분석 결과를 확인하세요.",
-        "tool_calls": tool_calls_history,
-        "iterations": max_iterations
-    }
-
-
 # ========== FastAPI Endpoints ==========
 
 @app.get("/health")
@@ -479,99 +394,106 @@ def health_check():
     return {
         "status": "ok",
         "service": "error-debugger",
-        "version": "3.0.0"
+        "version": "4.0.0"
     }
 
 
 @app.post("/analyze")
 async def analyze_error(request: ErrorRequest):
-    """
-    AI 에이전트가 FastMCP 툴을 사용하며 비즈니스 로직까지 분석합니다.
-
-    Flow:
-    1. PHP 서버 → FastAPI (에러 정보)
-    2. AI 에이전트 시작
-    3. AI가 FastMCP read_file로 여러 파일 읽음
-    4. AI가 FastMCP search_files로 관련 파일 찾음
-    5. AI가 FastMCP grep_code로 함수/클래스 찾음
-    6. AI가 FastMCP list_directory로 구조 파악
-    7. AI가 비즈니스 로직 분석
-    8. 최종 결과 반환
-    """
+    """LangGraph로 에러 분석"""
     try:
         print("\n" + "="*80)
-        print("🚀 에러 분석 요청 시작")
-        print("="*80)
-        print(f"에러 타입: {request.error_type}")
-        print(f"에러 메시지: {request.error_message}")
-        print(f"스택 트레이스:\n{request.stack_trace}")
-        print(f"입력 파라미터: {request.input_params}")
-        print(f"서버 경로: {request.server_base_path}")
+        print("🚀 에러 분석 시작")
+        print(f"타입: {request.error_type}")
+        print(f"메시지: {request.error_message}")
         print("="*80)
 
-        # 1. 스택 트레이스에서 파일 위치 추출
+        # 파일 위치 추출
         file_locations = _extract_file_locations(
             request.stack_trace,
             request.server_base_path
         )
 
-        print(f"\n📍 추출된 파일 위치: {len(file_locations)}개")
+        print(f"\n📍 파일 위치: {len(file_locations)}개")
         for loc in file_locations:
             print(f"  - {loc['file']}:{loc['line']}")
 
         if not file_locations:
-            print("❌ 스택 트레이스에서 파일 위치를 찾을 수 없습니다.")
             return {
                 "success": False,
-                "error": "스택 트레이스에서 파일 위치를 찾을 수 없습니다.",
+                "error": "스택 트레이스에서 파일 위치를 찾을 수 없음",
                 "analysis": None
             }
 
-        # 2. AI 에이전트가 FastMCP 툴을 사용하며 분석
-        print("\n🤖 AI 에이전트 분석 시작...")
-        result = await _analyze_with_ai_agent(
-            error_type=request.error_type,
-            error_message=request.error_message,
-            stack_trace=request.stack_trace,
-            file_locations=file_locations,
-            input_params=request.input_params,
-            server_base_path=request.server_base_path
-        )
+        # LangGraph 실행
+        initial_state = {
+            "messages": [],
+            "error_info": {
+                "error_type": request.error_type,
+                "error_message": request.error_message,
+                "stack_trace": request.stack_trace,
+                "input_params": request.input_params,
+                "server_base_path": request.server_base_path
+            },
+            "analysis_result": None
+        }
+
+        # 그래프 실행
+        final_state = None
+        for state in graph.stream(initial_state, {"recursion_limit": 15}):
+            final_state = state
+            print(f"\n[DEBUG] State keys: {state.keys()}")
+
+        print(f"\n[DEBUG] Final state: {final_state}")
+
+        # 결과 추출
+        if final_state and "extract" in final_state:
+            analysis = final_state["extract"]["analysis_result"]
+            print(f"[DEBUG] Got analysis from extract node: {analysis[:100]}...")
+        elif final_state:
+            # 마지막 상태에서 분석 결과 찾기
+            last_state = list(final_state.values())[0]
+            print(f"[DEBUG] Last state keys: {last_state.keys() if isinstance(last_state, dict) else 'not a dict'}")
+
+            # messages에서 직접 추출 시도
+            if "messages" in last_state:
+                messages = last_state["messages"]
+                print(f"[DEBUG] Messages count: {len(messages)}")
+                for msg in reversed(messages):
+                    if isinstance(msg, AIMessage) and msg.content:
+                        analysis = msg.content
+                        print(f"[DEBUG] Found AI message: {analysis[:100]}...")
+                        break
+                else:
+                    analysis = last_state.get("analysis_result", "분석 실패")
+            else:
+                analysis = last_state.get("analysis_result", "분석 실패")
+        else:
+            analysis = "분석 실패"
 
         print(f"\n✅ 분석 완료!")
-        print(f"  - 툴 호출 횟수: {len(result['tool_calls'])}회")
-        print(f"  - 반복 횟수: {result['iterations']}회")
-        print(f"\n📊 툴 호출 내역:")
-        for i, tc in enumerate(result['tool_calls'], 1):
-            print(f"  {i}. {tc['tool']}({tc['arguments']})")
-
-        print(f"\n📝 분석 결과:")
-        print(result["analysis"][:500] + "..." if len(result["analysis"]) > 500 else result["analysis"])
+        print(f"\n📝 결과:\n{analysis}")
         print("\n" + "="*80)
 
         return {
             "success": True,
             "file_locations": file_locations,
-            "analysis": result["analysis"],
-            "tool_calls": result["tool_calls"],
-            "iterations": result["iterations"],
-            "using_fastmcp": True
+            "analysis": analysis
         }
 
     except Exception as e:
-        print(f"\n❌ 에러 발생: {str(e)}")
+        print(f"\n❌ 에러: {str(e)}")
         print("="*80)
         raise HTTPException(
             status_code=500,
-            detail=f"에러 분석 중 문제 발생: {str(e)}"
+            detail=f"분석 실패: {str(e)}"
         )
 
 
 if __name__ == "__main__":
     import uvicorn
-    print("🚀 Error Debugger API with AI Agent + FastMCP 시작")
-    print("   - AI 에이전트가 FastMCP 툴 사용")
-    print("   - 여러 파일을 읽으며 비즈니스 로직 분석")
-    print("   - OpenAI GPT-4o")
+    print("🚀 Error Debugger API (LangGraph)")
+    print("   - LangGraph State Machine")
+    print("   - 간결한 분석 결과")
     print("   - Port: 9000")
     uvicorn.run(app, host="0.0.0.0", port=9000)
