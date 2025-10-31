@@ -8,7 +8,6 @@ from pydantic import BaseModel, Field
 from typing import Optional, List, Annotated, TypedDict
 import os
 import re
-from pathlib import Path
 from dotenv import load_dotenv
 import json
 
@@ -18,11 +17,22 @@ from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 from langchain_core.tools import tool
 
+# MCP 관련 import
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+from langchain_mcp_adapters.tools import load_mcp_tools
+import asyncio
+
 # 환경 변수 로드
 load_dotenv()
 
 # LLM 초기화
-llm = ChatOpenAI(model="gpt-4o", temperature=0.3)
+llm = ChatOpenAI(model="gpt-4.1-mini", temperature=0.3)
+
+# GitHub 저장소 정보
+GITHUB_REPO_OWNER = os.getenv("GITHUB_REPO_OWNER", "fanding")
+GITHUB_REPO_NAME = os.getenv("GITHUB_REPO_NAME", "legacy-php-api")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 
 # FastAPI 앱
 app = FastAPI(
@@ -51,73 +61,57 @@ class ErrorRequest(BaseModel):
         default="/Users/fanding/develop/legacy-php-api",
         description="서버 코드 기본 경로"
     )
+    git_ref: Optional[str] = Field(
+        default="master",
+        description="Git 브랜치/태그/커밋 (예: master, develop, refs/heads/feature-branch)"
+    )
 
 
-# ========== LangChain Tools ==========
+# ========== GitHub MCP Tools ==========
 
-@tool
-def read_file(file_path: str) -> str:
-    """파일의 전체 내용을 읽습니다."""
+# GitHub MCP 서버 파라미터를 전역으로 저장
+github_mcp_server_params = None
+
+async def initialize_github_mcp():
+    """GitHub MCP 서버 파라미터를 초기화합니다."""
+    global github_mcp_server_params
+
+    if not GITHUB_TOKEN:
+        print("⚠️  GITHUB_TOKEN이 설정되지 않아 GitHub MCP를 사용할 수 없습니다.")
+        return False
+
     try:
-        # /home/fanding → /Users/fanding 경로 변환 (macOS)
-        if file_path.startswith('/home/fanding'):
-            file_path = file_path.replace('/home/fanding', '/Users/fanding')
+        # GitHub MCP 서버 설정 (npx 사용)
+        github_mcp_server_params = StdioServerParameters(
+            command="npx",
+            args=["-y", "@modelcontextprotocol/server-github"],
+            env={
+                "GITHUB_PERSONAL_ACCESS_TOKEN": GITHUB_TOKEN
+            }
+        )
 
-        if not os.path.isabs(file_path):
-            possible_bases = [
-                "/Users/fanding/develop/legacy-php-api",
-                "/Users/fanding/develop/ppp",
-                os.getcwd()
-            ]
-            for base in possible_bases:
-                full_path = os.path.join(base, file_path)
-                if os.path.exists(full_path):
-                    file_path = full_path
-                    break
+        print(f"🔌 GitHub MCP 서버 설정 완료 (repo: {GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME})")
 
-        print(f"[DEBUG] read_file: {file_path}, exists={os.path.exists(file_path)}")
+        # 테스트 연결로 도구 목록 확인
+        async with stdio_client(github_mcp_server_params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                tools = await load_mcp_tools(session)
+                print(f"✅ GitHub MCP 도구 {len(tools)}개 사용 가능")
+                print(f"\n📋 사용 가능한 도구 목록:")
+                for tool in tools[:26]:  # 처음 10개만 출력
+                    print(f"  - {tool.name}: {tool.description[:80] if hasattr(tool, 'description') and tool.description else 'No description'}...")
+               
+                print()
 
-        with open(file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-            print(f"[DEBUG] read_file: 읽은 길이 = {len(content)} bytes")
-            return content
+        return True
     except Exception as e:
-        return f"ERROR: {str(e)}"
+        print(f"❌ GitHub MCP 초기화 실패: {e}")
+        return False
 
 
-@tool
-def search_files(directory: str, pattern: str = "*.php") -> str:
-    """디렉토리에서 파일을 검색합니다."""
-    try:
-        import glob
-        if not os.path.isabs(directory):
-            directory = os.path.abspath(directory)
-        search_pattern = os.path.join(directory, "**", pattern)
-        files = glob.glob(search_pattern, recursive=True)
-        return json.dumps(files[:30], ensure_ascii=False)
-    except Exception as e:
-        return json.dumps([f"ERROR: {str(e)}"], ensure_ascii=False)
-
-
-@tool
-def grep_code(file_path: str, search_term: str) -> str:
-    """파일에서 특정 코드를 검색합니다."""
-    try:
-        # /home/fanding → /Users/fanding 경로 변환 (macOS)
-        if file_path.startswith('/home/fanding'):
-            file_path = file_path.replace('/home/fanding', '/Users/fanding')
-
-        content = read_file.invoke({"file_path": file_path})
-        if content.startswith("ERROR"):
-            return content
-        lines = content.split('\n')
-        results = []
-        for i, line in enumerate(lines, 1):
-            if search_term.lower() in line.lower():
-                results.append(f"Line {i}: {line.strip()}")
-        return "\n".join(results[:15]) if results else f"'{search_term}' 없음"
-    except Exception as e:
-        return f"ERROR: {str(e)}"
+# ========== 로컬 파일 도구 제거 ==========
+# GitHub MCP만 사용합니다.
 
 
 # ========== LangGraph State ==========
@@ -127,37 +121,21 @@ from operator import add
 class AgentState(TypedDict):
     messages: Annotated[list, add]  # add operator로 메시지 누적
     error_info: dict
+    error_line: int  # 에러 발생 라인 번호
+    git_ref: str  # Git 브랜치/태그/커밋
     analysis_result: Optional[str]
 
 
 # ========== LangGraph Nodes ==========
 
-def find_primary_error_file(stack_trace: str, base_paths: list) -> tuple:
-    """스택 트레이스에서 핵심 에러 파일 찾기"""
-    import re
-    exclude = ['/system/', '/vendor/', '/core/', 'CodeIgniter.php', 'index.php', '/bootstrap/']
 
-    for line in stack_trace.split('\n'):
-        match = re.search(r'#\d+\s+([^(]+\.php)\((\d+)\)', line)
-        if match:
-            file_path, line_no = match.groups()
-            if any(p in file_path for p in exclude):
-                continue
-
-            for base in base_paths:
-                for sub in ['', 'application/controllers/rest', 'application/controllers', 'application/models']:
-                    full = Path(base) / sub / Path(file_path).name
-                    if full.exists():
-                        return str(full), line_no
-    return None, None
-
-
-def analyze_node(state: AgentState):
-    """에러 분석 노드"""
+async def analyze_node(state: AgentState):
+    """에러 분석 노드 (비동기)"""
     print("\n🤖 AI 에이전트 분석 중...")
 
     messages = state["messages"]
     error_info = state["error_info"]
+    git_ref = state.get("git_ref", "enhance/ai-log-analysis")
 
     # 디버깅: 현재 messages 상태 확인
     print(f"[DEBUG] Current messages count: {len(messages)}")
@@ -166,96 +144,138 @@ def analyze_node(state: AgentState):
         has_tool_calls = hasattr(msg, 'tool_calls') and msg.tool_calls
         print(f"  [{i}] {msg_type}, tool_calls={has_tool_calls}")
 
-    # 🔧 경로 변환: /home/fanding → /Users/fanding (macOS 로컬 개발 환경)
-    stack_trace = error_info['stack_trace'].replace('/home/fanding', '/Users/fanding')
-    error_info['stack_trace'] = stack_trace
+    # 경로 정보만 출력 (로컬 파일 읽기 제거)
+    stack_trace = error_info['stack_trace']
+    print(f"📍 스택 트레이스 분석 중...")
 
-    # 🎯 핵심 에러 파일 먼저 읽기
-    base_paths = [
-        '/Users/fanding/develop/legacy-php-api',
-        '/Users/fanding/develop/ppp',
-        error_info.get('server_base_path', '')
-    ]
-
-    primary_file, error_line = find_primary_error_file(stack_trace, base_paths)
-
-    context_code = ""
-    if primary_file:
-        print(f"📍 시작점: {primary_file}:{error_line}")
-        try:
-            with open(primary_file, 'r', encoding='utf-8') as f:
-                context_code = f.read()[:5000]
-        except Exception as e:
-            print(f"⚠️  파일 읽기 실패: {e}")
-
-    # 🔑 첫 번째 호출인지 확인
-    is_first_call = len(messages) == 0
+    # 🔑 AI 메시지 카운트로 판단 (최대 4번까지 도구 사용 허용)
+    ai_count = sum(1 for m in messages if isinstance(m, AIMessage))
+    should_use_tools = ai_count < 4  # 최대 4번까지 도구 사용
 
     # 시스템 프롬프트
-    if is_first_call:
+    if should_use_tools:
         # 첫 번째: 도구 사용 가능
         system_msg = SystemMessage(content=f"""당신은 숙련된 PHP 백엔드 에러 분석 전문가입니다.
 
 **중요 정보:**
-- 실제 파일 위치: /Users/fanding/develop/legacy-php-api
-- 아래 에러 파일이 이미 제공되었습니다: {primary_file if primary_file else '없음'}
-- 제공된 파일만으로 충분하면 즉시 분석하세요
+- GitHub 저장소: {GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}
+- Git 브랜치/커밋: {git_ref}
+- 반드시 GitHub MCP 도구를 사용하여 저장소에서 파일을 읽어야 합니다
 
-**분석 방법:**
-1. **에러가 발생한 정확한 라인과 변수 특정**
-   - 어떤 변수/객체가 문제인가?
-   - 왜 null이거나 예상과 다른 값인가?
-   - 입력 파라미터 중 어떤 값이 잘못 들어왔는가?
+**핵심 규칙:**
+⚠️ 전체 파일을 일반적으로 분석하지 마세요!
+⚠️ 스택 트레이스의 **정확한 라인 번호**에 집중하세요!
 
-2. **근본 원인 파악**
-   - 호출 체인 분석 (어디서 넘어온 값인가?)
+**당신의 임무 (깊이 있는 분석):**
+1. **에러 파일 읽기**
+   - 스택 트레이스에서 파일 경로 추출
+   - 예: `/home/fanding/application/controllers/rest/Post.php:851` → `application/controllers/rest/Post.php`
+   - get_file_contents로 읽기 (owner={GITHUB_REPO_OWNER}, repo={GITHUB_REPO_NAME}, path=파일경로, ref={git_ref})
+
+2. **에러 라인 정확히 분석**
+   - 851번째 줄의 실제 코드 확인
+   - 어떤 함수/클래스를 호출하는가?
+   - 어떤 변수를 인자로 전달하는가?
+   - 그 변수는 어디서 왔는가? (같은 함수 내에서 추적)
+
+3. **관련 파일들 추가로 읽기 (중요!)**
+   - 에러 라인에서 호출하는 클래스 파일 읽기
+     예: `new Post_view_data($x)` → `repo/model_post/Post_view_data.php` 파일 읽기
+   - 그 클래스의 __construct() 함수 확인 → 왜 int를 요구하는지?
+   - 문제 변수가 다른 함수에서 왔다면, 그 함수도 추적
+   - 필요하면 search_repository로 관련 파일 찾기
+
+4. **함수 호출 흐름 추적**
+   - 입력 파라미터 → 현재 함수 → 문제 변수 → 에러 발생
+   - 각 단계에서 왜 타입이 변했는지 추적
+
+5. **근본 원인 파악**
    - 비즈니스 로직상 왜 이런 상황이 발생했는가?
-   - DB 쿼리 결과가 비어있는가? 조건문 체크가 누락됐는가?
+   - 앞단에서 validation이 빠졌는가?
+   - 데이터베이스에서 잘못된 타입으로 가져왔는가?
 
-3. **재발 방지를 위한 개선안 제시**
-   - 즉시 해결: 에러가 안 나도록 수정
-   - 장기 개선: 더 안전한 코드 구조 제안
+**중요: 여러 파일을 읽으면서 깊이 파고드세요!**
+- 한 파일만 읽고 끝내지 마세요
+- 최소 2-3개 파일을 읽어야 근본 원인을 찾을 수 있습니다
+- get_file_contents, search_repository 도구를 적극 활용하세요
 
-**출력 형식:**
-## 🔍 에러 위치
-- 파일: [파일명]:[라인번호]
-- 함수: [함수명]
-- 문제 변수: [변수명]
+**출력 형식 (깊이 있는 분석):**
 
-## 💥 원인 분석
-**즉시 원인:**
-- [어떤 변수가 null/잘못된 값인지]
-- [왜 그런 값이 들어왔는지]
-
-**근본 원인:**
-- [비즈니스 로직상 문제점]
-- [호출 경로 추적]
-
-## 🔧 해결 방법
-**즉시 수정 (Hot Fix):**
+## 🔍 에러 발생 위치
+- 파일: `Post.php:851`
+- 함수: `[함수명]`
+- 문제 라인 코드:
 ```php
-// 수정 전
-[기존 코드]
-
-// 수정 후
-[수정된 코드 + 주석으로 설명]
+[851번째 줄의 실제 코드]
 ```
 
-**장기 개선안:**
-- [더 안전한 코드 구조]
-- [validation 추가 제안]
-- [에러 핸들링 개선]
+## 📂 관련 파일 분석
+**읽은 파일들:**
+1. `application/controllers/rest/Post.php` - 에러 발생 지점
+2. `repo/model_post/Post_view_data.php` - 호출되는 클래스
+3. `[추가로 읽은 파일들]`
 
-**규칙:**
-- 제공된 에러 파일 코드를 우선 분석
-- 정말 필요한 경우만 read_file로 추가 파일 조회 (최대 1-2개)
-- 구체적인 변수명과 라인 번호 언급
-- "파일이 없다"고 말하지 말고 제공된 코드를 분석
+## 💥 원인 분석 (깊이 추적)
+
+**즉시 원인 (에러 라인):**
+- 851번째 줄: `[정확한 코드]`
+- 문제 변수: `$변수명`
+- 예상 타입: `int`
+- 실제 타입: `string`
+- 값: `"[실제 값]"` (어디서 왔는지)
+
+**변수 추적 (함수 내부):**
+- `$변수명`은 [몇 번째 줄]에서 할당됨
+- 할당 코드: `[코드 복사]`
+- 이 값은 [어디서] 왔는가? (파라미터? 다른 함수 리턴? DB?)
+
+**호출되는 클래스 분석:**
+- `Post_view_data` 클래스의 `__construct(int $postNo)` 시그니처 확인
+- 왜 int를 요구하는가? [비즈니스 로직 설명]
+
+**근본 원인 (비즈니스 로직):**
+- 이 코드의 목적: [무엇을 하려는 코드인가?]
+- 왜 string이 들어왔는가: [입력 파라미터 추적, validation 누락, DB 타입 문제 등]
+- 호출 흐름: [요청 → 라우터 → 컨트롤러 → 모델] 어느 단계에서 잘못되었는가?
+
+## 🔧 해결 방법
+
+**즉시 수정 (Hot Fix):**
+```php
+// 수정 전 (851번째 줄)
+[실제 코드]
+
+// 수정 후
+[타입 캐스팅 또는 validation 추가]
+```
+
+**근본적인 수정:**
+- [앞단에서 validation 추가]
+- [DB 스키마 수정 or 타입 변환 추가]
+- [관련 파일들의 수정 필요 사항]
+
+**예방 방법:**
+- Type hinting 강화
+- Validation 레이어 추가
+- Unit test 작성
+
+**중요:**
+- 여러 파일을 읽고 분석한 내용을 바탕으로 작성하세요
+- 변수가 어디서 왔는지 구체적으로 추적하세요
+- 한 파일만 보지 말고 관련 파일들을 모두 확인하세요
 """)
 
-        # 에러 정보
-        content = f"""에러 분석:
+        # 첫 번째 호출인지 확인
+        if ai_count == 0:
+            # 첫 번째: 에러 파일 읽기 시작
+            # 스택 트레이스에서 라인 번호 추출
+            import re
+            line_match = re.search(r'Post\.php.*?line (\d+)', error_info['error_message'])
+            error_line = line_match.group(1) if line_match else "unknown"
 
+            content = f"""🚨 **에러 분석 시작** 🚨
+
+**에러 정보:**
 타입: {error_info['error_type']}
 메시지: {error_info['error_message']}
 
@@ -263,68 +283,70 @@ def analyze_node(state: AgentState):
 {error_info['stack_trace']}
 
 파라미터: {error_info.get('input_params', '없음')}
+
+**첫 번째 작업: 에러가 발생한 파일을 읽으세요**
+- get_file_contents 도구로 Post.php 파일 읽기
+- owner: {GITHUB_REPO_OWNER}, repo: {GITHUB_REPO_NAME}, ref: {git_ref}
+- path: application/controllers/rest/Post.php
+- {error_line}번째 줄 주변을 중점적으로 확인
 """
+        else:
+            # 두 번째 이후: 더 깊이 파고들기
+            content = f"""이전에 읽은 파일을 바탕으로 더 깊이 분석하세요.
 
-        if context_code:
-            content += f"""
+**다음 작업:**
+1. 에러 라인에서 호출하는 클래스 파일을 추가로 읽으세요
+   예: `new Post_view_data($x)` → `repo/model_post/Post_view_data.php` 읽기
 
-📄 에러 파일 ({primary_file}:{error_line}):
-```php
-{context_code}
-```
+2. 문제 변수가 어디서 왔는지 추적하세요
+   - 함수 파라미터에서 왔다면, 호출하는 곳 찾기
+   - 다른 함수 리턴값이라면, 그 함수 찾기
+   - DB에서 왔다면, model 파일 읽기
+
+3. 필요하면 search_repository로 관련 파일 찾기
+
+**아직 충분한 정보를 모았다면:**
+- 최종 분석 결과를 작성하세요 (더 이상 도구 호출 안 함)
 """
 
         error_msg = HumanMessage(content=content)
 
-        llm_with_tools = llm.bind_tools([read_file, search_files, grep_code])
-        response = llm_with_tools.invoke([system_msg, error_msg])
+        # GitHub MCP 도구만 사용 - 매번 새로운 세션에서 도구 로드
+        if not github_mcp_server_params:
+            raise Exception("GitHub MCP가 초기화되지 않았습니다. GITHUB_TOKEN을 설정하고 서버를 재시작하세요.")
+
+        # 새로운 세션 생성 및 도구 로드
+        async with stdio_client(github_mcp_server_params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                tools = await load_mcp_tools(session)
+
+                llm_with_tools = llm.bind_tools(tools)
+                response = await llm_with_tools.ainvoke([system_msg, error_msg])
 
     else:
-        # 두 번째 이후: 도구 결과를 바탕으로 최종 분석 (도구 없이)
-        prompt_msg = HumanMessage(content="""도구 조회 결과를 바탕으로 최종 에러 분석을 작성하세요.
+        # 4번 이후: 도구 사용 끝, 최종 분석 (도구 없이)
+        print(f"🏁 최종 분석 단계 (AI 호출 {ai_count + 1}회차)")
+        prompt_msg = HumanMessage(content="""지금까지 여러 파일을 읽고 분석한 내용을 바탕으로 최종 에러 분석을 작성하세요.
 
-**출력 형식:**
-## 🔍 에러 위치
-- 파일: [파일명]:[라인번호]
-- 함수: [함수명]
-- 문제 변수: [변수명]
+**중요: 더 이상 도구를 호출하지 말고, 지금까지 수집한 정보로 상세한 분석을 완성하세요.**
 
-## 💥 원인 분석
-**즉시 원인:**
-- [어떤 변수가 null/잘못된 값인지]
-- [왜 그런 값이 들어왔는지]
-
-**근본 원인:**
-- [비즈니스 로직상 문제점]
-- [호출 경로 추적]
-
-## 🔧 해결 방법
-**즉시 수정 (Hot Fix):**
-```php
-// 수정 전
-[기존 코드]
-
-// 수정 후
-[수정된 코드 + 주석으로 설명]
-```
-
-**장기 개선안:**
-- [더 안전한 코드 구조]
-- [validation 추가 제안]
-- [에러 핸들링 개선]
-
-**중요: 더 이상 도구를 호출하지 말고, 지금 바로 상세한 분석 결과를 작성하세요.**
+출력 형식을 시스템 프롬프트에 명시된 대로 작성하세요:
+- 🔍 에러 발생 위치
+- 📂 관련 파일 분석 (읽은 파일들 나열)
+- 💥 원인 분석 (즉시 원인, 변수 추적, 호출되는 클래스 분석, 근본 원인)
+- 🔧 해결 방법 (즉시 수정, 근본적인 수정, 예방 방법)
 """)
 
         # messages 순서 유지: [AI(tool_calls), ToolMessage, ...]
-        response = llm.invoke(messages + [prompt_msg])
+        response = await llm.ainvoke(messages + [prompt_msg])
 
     return {"messages": messages + [response]}
 
 
-def tool_node_wrapper(state: AgentState):
-    """툴 실행 노드"""
-    print(f"🔧 툴 실행 중...")
+async def tool_node_wrapper(state: AgentState):
+    """툴 실행 노드 (비동기) - 매번 새로운 GitHub MCP 세션 생성"""
+    print(f"🔧 GitHub MCP 툴 실행 중...")
 
     messages = state["messages"]
 
@@ -333,20 +355,113 @@ def tool_node_wrapper(state: AgentState):
     for i, msg in enumerate(messages):
         msg_type = type(msg).__name__
         has_tool_calls = hasattr(msg, 'tool_calls') and msg.tool_calls
-        print(f"  [{i}] {msg_type}, tool_calls={has_tool_calls}")
+        if has_tool_calls:
+            tool_names = [tc.get('name') for tc in msg.tool_calls]
+            tool_args = [tc.get('args') for tc in msg.tool_calls]
+            print(f"  [{i}] {msg_type}, tool_calls={tool_names}")
+            for j, (name, args) in enumerate(zip(tool_names, tool_args)):
+                print(f"      Tool {j}: {name}({args})")
+        else:
+            print(f"  [{i}] {msg_type}, tool_calls=False")
 
-    tools = [read_file, search_files, grep_code]
-    tool_node = ToolNode(tools)
-    result = tool_node.invoke(state)
+    # GitHub MCP 세션 확인
+    if not github_mcp_server_params:
+        raise Exception("GitHub MCP가 초기화되지 않았습니다.")
 
-    # 디버깅: messages 구조 확인
-    print(f"[DEBUG] After tool execution, result messages count: {len(result.get('messages', []))}")
-    for i, msg in enumerate(result.get('messages', [])):
-        msg_type = type(msg).__name__
-        has_tool_calls = hasattr(msg, 'tool_calls') and msg.tool_calls
-        print(f"  [{i}] {msg_type}, tool_calls={has_tool_calls}")
+    # 새로운 세션 생성 및 도구 실행
+    async with stdio_client(github_mcp_server_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            tools = await load_mcp_tools(session)
 
-    return result
+            tool_node = ToolNode(tools)
+            result = await tool_node.ainvoke(state)
+
+            # GitHub 파일 내용 처리 및 에러 라인 추출
+            import json
+
+            # state에서 에러 라인 번호 가져오기
+            error_line_num = state.get('error_line')
+            if error_line_num:
+                print(f"🎯 에러 라인 번호 사용: {error_line_num}")
+            else:
+                print("⚠️ 에러 라인 번호를 찾을 수 없음")
+
+            messages = result.get('messages', [])
+            for msg in messages:
+                if type(msg).__name__ == 'ToolMessage':
+                    try:
+                        # JSON 파싱
+                        parsed = json.loads(msg.content)
+
+                        # content 필드가 있는 경우 (GitHub MCP는 이미 디코딩된 문자열을 반환함)
+                        if 'content' in parsed:
+                            file_content = parsed['content']
+                            print(f"✅ GitHub 파일 내용 확인: {len(file_content)} chars")
+
+                            # 에러 라인 주변 코드 추출 (±30줄)
+                            if error_line_num:
+                                lines = file_content.split('\n')
+                                total_lines = len(lines)
+
+                                # 에러 라인 주변만 추출 (전체 파일 대신)
+                                context_range = 30
+                                start = max(0, error_line_num - context_range - 1)  # 배열은 0-based
+                                end = min(total_lines, error_line_num + context_range)
+
+                                error_lines = []
+                                for i in range(start, end):
+                                    line_marker = ">>> 🔥 " if (i + 1) == error_line_num else "     "
+                                    error_lines.append(f"{line_marker}{i+1:4d} | {lines[i]}")
+
+                                error_context = "\n".join(error_lines)
+                                print(f"✅ 에러 라인 컨텍스트 추출 완료: {error_line_num}번 라인 (±{context_range}줄)")
+
+                                # 새로운 형식으로 변환 - 에러 라인 주변 코드만 제공
+                                new_content = f"""📄 파일: {parsed.get('name', 'unknown')}
+경로: {parsed.get('path', 'unknown')}
+전체 크기: {parsed.get('size', 0)} bytes (총 {total_lines}줄)
+
+🎯🎯🎯 에러 발생 라인 {error_line_num} 주변 코드 (±{context_range}줄) 🎯🎯🎯
+{'='*80}
+{error_context}
+{'='*80}
+
+⚠️ **중요: {error_line_num}번 라인 (🔥 표시)의 코드를 정확히 분석하세요!**
+이 라인에서 Post_view_data::__construct()가 호출되고 있고,
+첫 번째 인자로 int가 아닌 string이 전달되어 에러가 발생했습니다.
+"""
+                            else:
+                                # 에러 라인을 못 찾은 경우에만 전체 파일 제공
+                                print("⚠️ 에러 라인 번호를 찾을 수 없어 전체 파일 제공")
+                                new_content = f"""📄 파일: {parsed.get('name', 'unknown')}
+경로: {parsed.get('path', 'unknown')}
+크기: {parsed.get('size', 0)} bytes
+
+=== 전체 파일 내용 ===
+{file_content}
+=== 파일 내용 끝 ===
+"""
+
+                            # 메시지 내용 교체
+                            msg.content = new_content
+                            print(f"✅ GitHub 파일 포맷 변환 완료")
+                    except Exception as e:
+                        import traceback
+                        print(f"⚠️ 파일 처리 실패: {e}")
+                        print(f"📍 상세 에러:\n{traceback.format_exc()}")
+
+            # 디버깅: messages 구조 확인
+            print(f"[DEBUG] After tool execution, result messages count: {len(messages)}")
+            for i, msg in enumerate(messages):
+                msg_type = type(msg).__name__
+                if msg_type == 'ToolMessage':
+                    content_preview = str(msg.content)[:300]
+                    print(f"  [{i}] {msg_type}, content_preview: {content_preview}...")
+                else:
+                    print(f"  [{i}] {msg_type}")
+
+            return result
 
 
 def should_continue(state: AgentState):
@@ -366,8 +481,8 @@ def should_continue(state: AgentState):
     return "end"
 
 
-def extract_result(state: AgentState):
-    """최종 결과 추출"""
+async def extract_result(state: AgentState):
+    """최종 결과 추출 (비동기)"""
     messages = state["messages"]
 
     # 마지막 AI 메시지 찾기
@@ -476,6 +591,17 @@ async def analyze_error(request: ErrorRequest):
                 "analysis": None
             }
 
+        # 에러 라인 번호 추출 (스택 트레이스에서 첫 번째 발생 위치)
+        import re
+        error_line = None
+        line_match = re.search(r'Post\.php.*?line (\d+)', request.error_message)
+        if line_match:
+            error_line = int(line_match.group(1))
+            print(f"🎯 에러 라인 추출: {error_line}")
+
+        # Git ref 정보 출력
+        print(f"📌 Git ref: {request.git_ref}")
+
         # LangGraph 실행
         initial_state = {
             "messages": [],
@@ -486,12 +612,14 @@ async def analyze_error(request: ErrorRequest):
                 "input_params": request.input_params,
                 "server_base_path": request.server_base_path
             },
+            "error_line": error_line,
+            "git_ref": request.git_ref,
             "analysis_result": None
         }
 
-        # 그래프 실행
+        # 그래프 실행 (비동기)
         final_state = None
-        for state in graph.stream(initial_state, {"recursion_limit": 15}):
+        async for state in graph.astream(initial_state, {"recursion_limit": 15}):
             final_state = state
             print(f"\n[DEBUG] State keys: {state.keys()}")
 
@@ -541,10 +669,24 @@ async def analyze_error(request: ErrorRequest):
         )
 
 
+@app.on_event("startup")
+async def startup_event():
+    """서버 시작 시 GitHub MCP 초기화"""
+    print("\n" + "="*80)
+    print("🚀 Error Debugger API (LangGraph) 시작")
+    print("="*80)
+    await initialize_github_mcp()
+    print("="*80 + "\n")
+
+
 if __name__ == "__main__":
     import uvicorn
     print("🚀 Error Debugger API (LangGraph)")
     print("   - LangGraph State Machine")
-    print("   - 간결한 분석 결과")
+    print("   - GitHub MCP 통합")
     print("   - Port: 9000")
+    print("\n💡 GitHub MCP 사용을 위해 .env 파일에 다음을 설정하세요:")
+    print("   GITHUB_TOKEN=your_github_personal_access_token")
+    print("   GITHUB_REPO_OWNER=fanding")
+    print("   GITHUB_REPO_NAME=legacy-php-api\n")
     uvicorn.run(app, host="0.0.0.0", port=9000)
