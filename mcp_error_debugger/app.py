@@ -124,6 +124,7 @@ class AgentState(TypedDict):
     error_line: int  # 에러 발생 라인 번호
     git_ref: str  # Git 브랜치/태그/커밋
     analysis_result: Optional[str]
+    token_usage: dict  # 토큰 사용량 추적
 
 
 # ========== LangGraph Nodes ==========
@@ -148,9 +149,9 @@ async def analyze_node(state: AgentState):
     stack_trace = error_info['stack_trace']
     print(f"📍 스택 트레이스 분석 중...")
 
-    # 🔑 AI 메시지 카운트로 판단 (최대 4번까지 도구 사용 허용)
+    # 🔑 AI 메시지 카운트로 판단 (최대 3번까지 도구 사용 허용)
     ai_count = sum(1 for m in messages if isinstance(m, AIMessage))
-    should_use_tools = ai_count < 4  # 최대 4번까지 도구 사용
+    should_use_tools = ai_count < 3  # 최대 3번까지 도구 사용
 
     # 시스템 프롬프트
     if should_use_tools:
@@ -199,70 +200,27 @@ async def analyze_node(state: AgentState):
 - 최소 2-3개 파일을 읽어야 근본 원인을 찾을 수 있습니다
 - get_file_contents, search_repository 도구를 적극 활용하세요
 
-**출력 형식 (깊이 있는 분석):**
+**출력 형식 (간결하게!):**
 
-## 🔍 에러 발생 위치
-- 파일: `Post.php:851`
-- 함수: `[함수명]`
-- 문제 라인 코드:
-```php
-[851번째 줄의 실제 코드]
-```
+## 🎯 원인 분석
 
-## 📂 관련 파일 분석
-**읽은 파일들:**
-1. `application/controllers/rest/Post.php` - 에러 발생 지점
-2. `repo/model_post/Post_view_data.php` - 호출되는 클래스
-3. `[추가로 읽은 파일들]`
+**에러 위치:**
+- 파일: Post.php:851
+- 메서드: [메서드명]
+- 코드: `[실제 코드 한 줄]`
 
-## 💥 원인 분석 (깊이 추적)
+**왜 에러가 났는가:**
+1. [에러 라인에서 무엇을 했는지]
+   예: `$badData = $this->model_post->getPostViewDataWithBadTypes()`
+2. [그 메서드/함수가 무엇을 반환했는지]
+   예: DB 쿼리 - `SELECT CONCAT('POST_', no) AS post_no ...`
+3. [왜 타입이 안 맞는지]
+   예: CONCAT은 문자열 반환 → 'POST_10738', 생성자는 int 요구
 
-**즉시 원인 (에러 라인):**
-- 851번째 줄: `[정확한 코드]`
-- 문제 변수: `$변수명`
-- 예상 타입: `int`
-- 실제 타입: `string`
-- 값: `"[실제 값]"` (어디서 왔는지)
+**해결:**
+`(int)$badData['post_no']` 또는 쿼리 수정
 
-**변수 추적 (함수 내부):**
-- `$변수명`은 [몇 번째 줄]에서 할당됨
-- 할당 코드: `[코드 복사]`
-- 이 값은 [어디서] 왔는가? (파라미터? 다른 함수 리턴? DB?)
-
-**호출되는 클래스 분석:**
-- `Post_view_data` 클래스의 `__construct(int $postNo)` 시그니처 확인
-- 왜 int를 요구하는가? [비즈니스 로직 설명]
-
-**근본 원인 (비즈니스 로직):**
-- 이 코드의 목적: [무엇을 하려는 코드인가?]
-- 왜 string이 들어왔는가: [입력 파라미터 추적, validation 누락, DB 타입 문제 등]
-- 호출 흐름: [요청 → 라우터 → 컨트롤러 → 모델] 어느 단계에서 잘못되었는가?
-
-## 🔧 해결 방법
-
-**즉시 수정 (Hot Fix):**
-```php
-// 수정 전 (851번째 줄)
-[실제 코드]
-
-// 수정 후
-[타입 캐스팅 또는 validation 추가]
-```
-
-**근본적인 수정:**
-- [앞단에서 validation 추가]
-- [DB 스키마 수정 or 타입 변환 추가]
-- [관련 파일들의 수정 필요 사항]
-
-**예방 방법:**
-- Type hinting 강화
-- Validation 레이어 추가
-- Unit test 작성
-
-**중요:**
-- 여러 파일을 읽고 분석한 내용을 바탕으로 작성하세요
-- 변수가 어디서 왔는지 구체적으로 추적하세요
-- 한 파일만 보지 말고 관련 파일들을 모두 확인하세요
+**간결하게! 핵심만!**
 """)
 
         # 첫 번째 호출인지 확인
@@ -273,14 +231,23 @@ async def analyze_node(state: AgentState):
             line_match = re.search(r'Post\.php.*?line (\d+)', error_info['error_message'])
             error_line = line_match.group(1) if line_match else "unknown"
 
+            # 스택 트레이스에서 실제 전달된 인자 값 추출
+            import re
+            arg_match = re.search(r'__construct\((.*?)\)', error_info['stack_trace'])
+            actual_args = arg_match.group(1) if arg_match else "확인 안 됨"
+
             content = f"""🚨 **에러 분석 시작** 🚨
 
 **에러 정보:**
 타입: {error_info['error_type']}
 메시지: {error_info['error_message']}
 
-스택:
+**스택 트레이스:**
 {error_info['stack_trace']}
+
+**⚠️ 중요: 스택 트레이스에서 실제 전달된 인자 값:**
+`__construct({actual_args})`
+→ 이 값들을 분석에 활용하세요!
 
 파라미터: {error_info.get('input_params', '없음')}
 
@@ -289,24 +256,30 @@ async def analyze_node(state: AgentState):
 - owner: {GITHUB_REPO_OWNER}, repo: {GITHUB_REPO_NAME}, ref: {git_ref}
 - path: application/controllers/rest/Post.php
 - {error_line}번째 줄 주변을 중점적으로 확인
+- 실제 전달된 값: {actual_args}
 """
         else:
             # 두 번째 이후: 더 깊이 파고들기
             content = f"""이전에 읽은 파일을 바탕으로 더 깊이 분석하세요.
 
 **다음 작업:**
-1. 에러 라인에서 호출하는 클래스 파일을 추가로 읽으세요
-   예: `new Post_view_data($x)` → `repo/model_post/Post_view_data.php` 읽기
+1. **에러 라인에서 호출하는 클래스/메서드를 추적하세요**
+   - 851번 라인에서 어떤 메서드를 호출했는지 확인
+   - 그 메서드가 정의된 파일을 찾아서 읽기
+   - 예: `getPostViewDataWithBadTypes()` 같은 메서드 → model_post.php 읽기
 
-2. 문제 변수가 어디서 왔는지 추적하세요
-   - 함수 파라미터에서 왔다면, 호출하는 곳 찾기
-   - 다른 함수 리턴값이라면, 그 함수 찾기
-   - DB에서 왔다면, model 파일 읽기
+2. **문제 변수의 출처를 추적하세요**
+   - 스택 트레이스의 실제 값을 확인했으니, 왜 그런 값이 나왔는지 추적
+   - DB 쿼리를 확인 (CONCAT, CAST 등 타입 변환 확인)
+   - 예: `'POST_10738'` → CONCAT('POST_', no) 같은 쿼리 찾기
 
-3. 필요하면 search_repository로 관련 파일 찾기
+3. **클래스 파일을 찾으세요**
+   - `Post_view_data` 클래스 파일 찾기
+   - 경로: `application/objects/repo/model_post/Post_view_data.php`
+   - search_repository나 get_file_contents 사용
 
-**아직 충분한 정보를 모았다면:**
-- 최종 분석 결과를 작성하세요 (더 이상 도구 호출 안 함)
+**충분한 정보를 모았다면:**
+- 구체적인 값과 메서드 이름을 언급하며 최종 분석 작성
 """
 
         error_msg = HumanMessage(content=content)
@@ -325,23 +298,50 @@ async def analyze_node(state: AgentState):
                 response = await llm_with_tools.ainvoke([system_msg, error_msg])
 
     else:
-        # 4번 이후: 도구 사용 끝, 최종 분석 (도구 없이)
+        # 3번 이후: 도구 사용 끝, 최종 분석 (도구 없이)
         print(f"🏁 최종 분석 단계 (AI 호출 {ai_count + 1}회차)")
-        prompt_msg = HumanMessage(content="""지금까지 여러 파일을 읽고 분석한 내용을 바탕으로 최종 에러 분석을 작성하세요.
+        prompt_msg = HumanMessage(content="""지금까지 읽은 파일을 바탕으로 간결하게 분석하세요.
 
-**중요: 더 이상 도구를 호출하지 말고, 지금까지 수집한 정보로 상세한 분석을 완성하세요.**
+**형식:**
+## 🎯 원인 분석
+**에러 위치:** 파일:라인, 메서드, 코드
+**왜 에러가 났는가:** 3단계로 (무엇을 했는지 → 무엇을 반환했는지 → 왜 타입 안 맞는지)
+**해결:** 한 줄 수정
 
-출력 형식을 시스템 프롬프트에 명시된 대로 작성하세요:
-- 🔍 에러 발생 위치
-- 📂 관련 파일 분석 (읽은 파일들 나열)
-- 💥 원인 분석 (즉시 원인, 변수 추적, 호출되는 클래스 분석, 근본 원인)
-- 🔧 해결 방법 (즉시 수정, 근본적인 수정, 예방 방법)
+간결하게! 사족 없이!
 """)
 
         # messages 순서 유지: [AI(tool_calls), ToolMessage, ...]
         response = await llm.ainvoke(messages + [prompt_msg])
 
-    return {"messages": messages + [response]}
+    # 토큰 사용량 추적
+    current_token_usage = state.get("token_usage", {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+
+    # 디버깅: response 구조 확인
+    print(f"[DEBUG] Response type: {type(response)}")
+    print(f"[DEBUG] Has usage_metadata: {hasattr(response, 'usage_metadata')}")
+    print(f"[DEBUG] Has response_metadata: {hasattr(response, 'response_metadata')}")
+    if hasattr(response, 'response_metadata'):
+        print(f"[DEBUG] response_metadata keys: {response.response_metadata.keys() if response.response_metadata else 'None'}")
+
+    # LangChain AIMessage의 usage_metadata 확인
+    if hasattr(response, 'usage_metadata') and response.usage_metadata:
+        current_token_usage["input_tokens"] += response.usage_metadata.get("input_tokens", 0)
+        current_token_usage["output_tokens"] += response.usage_metadata.get("output_tokens", 0)
+        current_token_usage["total_tokens"] += response.usage_metadata.get("total_tokens", 0)
+        print(f"  [AI 호출 {ai_count + 1}] 입력: {response.usage_metadata.get('input_tokens', 0)}, 출력: {response.usage_metadata.get('output_tokens', 0)}")
+    elif hasattr(response, 'response_metadata') and 'token_usage' in response.response_metadata:
+        # 다른 형태의 메타데이터
+        token_info = response.response_metadata['token_usage']
+        current_token_usage["input_tokens"] += token_info.get("prompt_tokens", 0)
+        current_token_usage["output_tokens"] += token_info.get("completion_tokens", 0)
+        current_token_usage["total_tokens"] += token_info.get("total_tokens", 0)
+        print(f"  [AI 호출 {ai_count + 1}] 입력: {token_info.get('prompt_tokens', 0)}, 출력: {token_info.get('completion_tokens', 0)}")
+
+    return {
+        "messages": messages + [response],
+        "token_usage": current_token_usage
+    }
 
 
 async def tool_node_wrapper(state: AgentState):
@@ -469,10 +469,10 @@ def should_continue(state: AgentState):
     messages = state["messages"]
     last_message = messages[-1]
 
-    # AI 메시지 카운트 (최대 5번만 반복)
+    # AI 메시지 카운트 (최대 4번만 반복)
     ai_count = sum(1 for m in messages if isinstance(m, AIMessage))
-    if ai_count >= 5:
-        print(f"⚠️  최대 반복 횟수 도달 ({ai_count}회), 강제 종료")
+    if ai_count >= 4:
+        print(f"✅ 분석 완료 ({ai_count}회 반복)")
         return "end"
 
     # 툴 호출이 있으면 계속
@@ -614,16 +614,39 @@ async def analyze_error(request: ErrorRequest):
             },
             "error_line": error_line,
             "git_ref": request.git_ref,
-            "analysis_result": None
+            "analysis_result": None,
+            "token_usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
         }
 
-        # 그래프 실행 (비동기)
+        # 그래프 실행 (비동기) - 전체 상태 추적
         final_state = None
+        accumulated_token_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
         async for state in graph.astream(initial_state, {"recursion_limit": 15}):
-            final_state = state
             print(f"\n[DEBUG] State keys: {state.keys()}")
 
+            # 각 노드의 token_usage 누적
+            for node_name, node_state in state.items():
+                if isinstance(node_state, dict) and "token_usage" in node_state:
+                    accumulated_token_usage = node_state["token_usage"]
+                    print(f"[DEBUG] {node_name} 노드의 토큰: {accumulated_token_usage}")
+
+            final_state = state
+
         print(f"\n[DEBUG] Final state: {final_state}")
+
+        # 토큰 사용량 출력
+        if accumulated_token_usage["total_tokens"] > 0:
+            print(f"\n{'='*60}")
+            print(f"📊 토큰 사용량")
+            print(f"{'='*60}")
+            print(f"  입력 토큰  : {accumulated_token_usage['input_tokens']:>10,}")
+            print(f"  출력 토큰  : {accumulated_token_usage['output_tokens']:>10,}")
+            print(f"  {'─'*56}")
+            print(f"  총 토큰    : {accumulated_token_usage['total_tokens']:>10,}")
+            print(f"{'='*60}")
+        else:
+            print("\n⚠️ 토큰 사용량 정보를 찾을 수 없습니다.")
 
         # 결과 추출
         if final_state and "extract" in final_state:
