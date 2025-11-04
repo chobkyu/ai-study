@@ -51,16 +51,18 @@ class ErrorRequest(BaseModel):
 # ========== Tools for AI Agent ==========
 # OpenAI 에이전트가 사용할 툴들
 
-def read_file(file_path: str, max_lines: int = 2000) -> str:
+def read_file(file_path: str, max_lines: int = 2000, error_line: int = None, context_range: int = 50) -> str:
     """
-    파일 내용을 읽습니다. 큰 파일은 자동으로 잘라서 반환합니다.
+    파일 내용을 읽습니다. 에러 라인이 지정되면 주변 컨텍스트만 반환합니다.
 
     Args:
         file_path: 읽을 파일의 경로 (절대경로 또는 상대경로)
         max_lines: 최대 읽을 라인 수 (기본 2000줄)
+        error_line: 에러 발생 라인 번호 (지정 시 주변만 반환)
+        context_range: 에러 라인 주변 범위 (기본 50줄)
 
     Returns:
-        파일 내용
+        파일 내용 또는 에러 라인 주변 컨텍스트
     """
     try:
         # 상대경로를 절대경로로 변환
@@ -87,6 +89,28 @@ def read_file(file_path: str, max_lines: int = 2000) -> str:
 
         total_lines = len(lines)
 
+        # 에러 라인이 지정된 경우 주변 컨텍스트만 반환
+        if error_line is not None and error_line > 0:
+            start = max(0, error_line - context_range - 1)
+            end = min(total_lines, error_line + context_range)
+
+            context_lines = []
+            for i in range(start, end):
+                line_marker = ">>> 🔥 " if (i + 1) == error_line else "     "
+                context_lines.append(f"{line_marker}{i+1:4d} | {lines[i].rstrip()}")
+
+            context = "\n".join(context_lines)
+            header = f"📄 파일: {os.path.basename(file_path)}\n"
+            header += f"경로: {file_path}\n"
+            header += f"전체 크기: {total_lines}줄\n\n"
+            header += f"🎯 에러 발생 라인 {error_line} 주변 코드 (±{context_range}줄)\n"
+            header += "="*80 + "\n"
+            footer = "\n" + "="*80 + "\n"
+            footer += f"\n⚠️ 에러는 {error_line}번 라인 (🔥 표시)에서 발생했습니다.\n"
+
+            return header + context + footer
+
+        # 에러 라인이 없으면 기존 방식대로
         # 파일이 너무 크면 잘라서 반환
         if total_lines > max_lines:
             content = ''.join(lines[:max_lines])
@@ -128,19 +152,21 @@ def search_files(directory: str, pattern: str = "*.php") -> str:
         return json.dumps([f"ERROR: {str(e)}"], ensure_ascii=False)
 
 
-def grep_code(file_path: str, search_term: str) -> str:
+def grep_code(file_path: str, search_term: str, max_results: int = 10) -> str:
     """
-    파일에서 특정 코드나 함수를 검색합니다.
+    파일에서 특정 코드나 함수를 검색합니다. (토큰 절약을 위해 최대 10개 결과만 반환)
 
     Args:
         file_path: 검색할 파일 경로
         search_term: 검색할 코드 (함수명, 클래스명, 변수명 등)
+        max_results: 최대 결과 개수 (기본 10개)
 
     Returns:
         검색 결과 (라인 번호와 내용)
     """
     try:
-        content = read_file(file_path)
+        # 파일을 작게 읽기 (최대 1000줄)
+        content = read_file(file_path, max_lines=1000)
 
         if content.startswith("ERROR"):
             return content
@@ -150,12 +176,17 @@ def grep_code(file_path: str, search_term: str) -> str:
 
         for i, line in enumerate(lines, 1):
             if search_term.lower() in line.lower():
-                results.append(f"Line {i}: {line.strip()}")
+                # 라인을 짧게 자르기 (최대 150자)
+                trimmed = line.strip()[:150]
+                results.append(f"Line {i}: {trimmed}")
+
+                if len(results) >= max_results:
+                    break
 
         if not results:
             return f"'{search_term}'을(를) 찾을 수 없습니다."
 
-        return "\n".join(results[:20])  # 최대 20개
+        return "\n".join(results)
 
     except Exception as e:
         return f"ERROR: {str(e)}"
@@ -201,13 +232,17 @@ def get_openai_tools():
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "파일의 전체 내용을 읽습니다. 에러가 발생한 파일이나 관련된 다른 파일들을 읽을 때 사용하세요.",
+                "description": "파일의 내용을 읽습니다. error_line이 지정되면 해당 라인 주변만 반환하여 토큰을 절약합니다.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "file_path": {
                             "type": "string",
                             "description": "읽을 파일의 경로 (절대경로 또는 상대경로)"
+                        },
+                        "error_line": {
+                            "type": "integer",
+                            "description": "에러가 발생한 라인 번호 (지정 시 주변 ±50줄만 반환)"
                         }
                     },
                     "required": ["file_path"]
@@ -280,7 +315,8 @@ def get_openai_tools():
 def execute_tool(tool_name: str, arguments: dict) -> str:
     """툴 실행"""
     if tool_name == "read_file":
-        return read_file(arguments["file_path"])
+        error_line = arguments.get("error_line")
+        return read_file(arguments["file_path"], error_line=error_line)
     elif tool_name == "search_files":
         pattern = arguments.get("pattern", "*.php")
         return search_files(arguments["directory"], pattern)
@@ -293,6 +329,48 @@ def execute_tool(tool_name: str, arguments: dict) -> str:
 
 
 # ========== Helper Functions ==========
+
+def _extract_stack_trace_insights(stack_trace: str) -> dict:
+    """
+    스택 트레이스에서 중요한 정보를 추출합니다.
+    - 실제 함수 호출 시 전달된 인자 값
+    - 함수/메서드 이름
+    - 타입 정보
+    """
+    insights = {
+        "actual_arguments": [],
+        "function_calls": [],
+        "type_errors": []
+    }
+
+    # PHP 함수 호출에서 실제 인자 값 추출
+    # 예: __construct('POST_10738', '1746', 'yes', 'invalid_price')
+    arg_pattern = r'(\w+)\((.*?)\)'
+    for match in re.finditer(arg_pattern, stack_trace):
+        function_name = match.group(1)
+        args_str = match.group(2)
+
+        if args_str and args_str.strip():
+            insights["function_calls"].append({
+                "function": function_name,
+                "arguments": args_str
+            })
+
+            # __construct나 주요 함수면 강조
+            if function_name in ['__construct', 'new', 'call_user_func']:
+                insights["actual_arguments"].append(f"{function_name}({args_str})")
+
+    # 타입 에러 정보 추출
+    # 예: "must be of the type int, string given"
+    type_pattern = r'must be of the type (\w+), (\w+) given'
+    type_match = re.search(type_pattern, stack_trace)
+    if type_match:
+        insights["type_errors"].append({
+            "expected": type_match.group(1),
+            "actual": type_match.group(2)
+        })
+
+    return insights
 
 def _extract_file_locations(stack_trace: str, base_path: str) -> List[dict]:
     """스택 트레이스에서 파일 위치 정보 추출"""
@@ -334,6 +412,7 @@ async def _analyze_with_ai_agent(
     error_message: str,
     stack_trace: str,
     file_locations: List[dict],
+    error_line: int = None,
     input_params: Optional[str] = None,
     server_base_path: str = "/Users/fanding/develop/legacy-php-api"
 ) -> dict:
@@ -341,58 +420,44 @@ async def _analyze_with_ai_agent(
     AI 에이전트가 FastMCP 툴을 사용하며 비즈니스 로직까지 분석합니다.
     """
 
-    # 초기 컨텍스트
-    initial_context = f"""당신은 전문 소프트웨어 디버거이자 코드 분석가입니다.
+    # 스택 트레이스 분석
+    stack_insights = _extract_stack_trace_insights(stack_trace)
 
-## 에러 정보
-- **에러 타입**: {error_type}
-- **에러 메시지**: {error_message}
+    # 실제 인자 값 강조
+    actual_args_info = ""
+    if stack_insights["actual_arguments"]:
+        actual_args_info = f"""
+🔥 **스택 트레이스에서 발견한 실제 인자 값:**
+{chr(10).join(f"   - {arg}" for arg in stack_insights["actual_arguments"])}
 
-## 스택 트레이스
-```
-{stack_trace}
-```
+⚠️ **이 값들이 핵심입니다!** 왜 이런 값이 전달되었는지 추적하세요!
+"""
 
-## 입력 파라미터
-{input_params if input_params else "없음"}
+    # 타입 에러 정보
+    type_error_info = ""
+    if stack_insights["type_errors"]:
+        te = stack_insights["type_errors"][0]
+        type_error_info = f"**타입 불일치:** 예상={te['expected']}, 실제={te['actual']}\n"
 
-## 에러 발생 파일들
-{json.dumps(file_locations, indent=2, ensure_ascii=False)}
+    # 초기 컨텍스트 (간결하게!)
+    initial_context = f"""PHP 에러 디버깅. 빠르고 간결하게!
 
-## 서버 경로
-{server_base_path}
+**에러:** {error_type}
+**메시지:** {error_message}
+{type_error_info}**에러 라인:** {error_line if error_line else "확인 필요"}
+{actual_args_info}
+**임무 (3단계만):**
+1. 에러 파일 읽기: `read_file(file_path="{server_base_path}/application/controllers/rest/Post.php", error_line={error_line})`
+2. 호출된 메서드 파일 읽기 (1개만): 보통 model_post.php 같은 파일
+   - **큰 파일이므로 read_file만 사용** (grep_code ❌)
+3. **즉시 분석 완료** - 위 2개 파일만으로 충분!
 
-## ⚠️ 중요: 파일 경로 규칙
-스택 트레이스의 `/home/fanding/...` 경로는 **서버 경로**입니다.
-로컬에서 읽을 때는 **{server_base_path}**로 시작해야 합니다!
+**절대 금지:**
+❌ grep_code 사용 금지 (파일이 너무 커서 비효율적)
+❌ search_files 사용 금지
+❌ 3개 이상 파일 읽기 금지
 
-예시:
-❌ 잘못: `/home/fanding/application/controllers/rest/Post.php`
-✅ 올바름: `{server_base_path}/application/controllers/rest/Post.php`
-
-## 당신의 임무 (빠르고 효율적으로!)
-1. **에러 파일 읽기** (필수 1회)
-   - 에러 발생 파일: `{server_base_path}/application/controllers/rest/Post.php`
-   - read_file로 읽기 (grep ❌)
-   - 에러 라인 주변 확인
-
-2. **관련 메서드가 있는 파일 읽기** (필수 1회)
-   - 851번 라인에서 호출하는 메서드 찾기
-   - 보통 `model_post.php` 같은 모델 파일
-   - **read_file로 전체 읽기** (grep ❌)
-   - SQL 쿼리 내용 확인 (CONCAT, CAST 등)
-
-3. **필요하면 클래스 파일 읽기** (선택적 1회)
-   - `Post_view_data` 클래스 정의
-   - 경로: `{server_base_path}/application/objects/repo/model_post/Post_view_data.php`
-
-**금지 사항:**
-- ❌ grep_code 남발 금지 (read_file 사용)
-- ❌ search_files 남발 금지 (경로를 정확히 알려드림)
-- ❌ list_directory 금지
-- ❌ 같은 파일 여러 번 읽기 금지
-
-**목표: 3개 파일만 read_file로 읽고 바로 분석!**
+**목표:** read_file 2-3회만 호출하고 바로 최종 분석!
 
 ## 분석 결과 형식 (간결하게!)
 
@@ -414,12 +479,12 @@ async def _analyze_with_ai_agent(
 """
 
     messages = [
-        {"role": "system", "content": "당신은 FastMCP 툴을 사용할 수 있는 전문 디버거입니다. 여러 파일을 읽으며 비즈니스 로직까지 깊이 분석합니다."},
+        {"role": "system", "content": "전문 PHP 디버거. **절대 규칙: grep_code 사용 금지!** read_file만 사용하고 error_line 파라미터 필수. 2-3개 파일만 읽고 즉시 분석 완료."},
         {"role": "user", "content": initial_context}
     ]
 
     tool_calls_history = []
-    max_iterations = 5  # 최대 5번 반복 (3개 파일 읽기 + 최종 분석)
+    max_iterations = 8  # 최대 8번 반복 (여유 있게)
 
     # 토큰 사용량 추적
     total_input_tokens = 0
@@ -428,15 +493,29 @@ async def _analyze_with_ai_agent(
 
     for iteration in range(max_iterations):
         try:
-            # OpenAI API 호출
-            response = openai_client.chat.completions.create(
-                model="gpt-4.1-mini",
-                messages=messages,
-                tools=get_openai_tools(),
-                tool_choice="auto",
-                temperature=0.3,
-                max_tokens=4000
-            )
+            # 4번째 반복부터는 툴 사용 중단하고 분석 요청
+            if iteration >= 4:
+                # 강제로 최종 분석 유도
+                messages.append({
+                    "role": "user",
+                    "content": "충분한 파일을 읽었습니다. 이제 툴 호출 없이 **즉시 최종 분석**을 작성하세요!"
+                })
+                response = openai_client.chat.completions.create(
+                    model="gpt-4.1-mini",
+                    messages=messages,
+                    temperature=0.3,
+                    max_tokens=4000
+                )
+            else:
+                # OpenAI API 호출
+                response = openai_client.chat.completions.create(
+                    model="gpt-4.1-mini",
+                    messages=messages,
+                    tools=get_openai_tools(),
+                    tool_choice="auto",
+                    temperature=0.3,
+                    max_tokens=4000
+                )
 
             # 토큰 사용량 누적
             if hasattr(response, 'usage'):
@@ -490,12 +569,18 @@ async def _analyze_with_ai_agent(
                     "result_preview": tool_result[:200] + "..." if len(tool_result) > 200 else tool_result
                 })
 
+                # 🔥 토큰 절약: 파일 내용이 너무 길면 요약해서 저장
+                condensed_result = tool_result
+                if function_name == "read_file" and len(tool_result) > 3000:
+                    # 파일 내용이 3000자 넘으면 앞부분만 유지
+                    condensed_result = tool_result[:3000] + f"\n\n... (나머지 {len(tool_result) - 3000}자 생략, 필요하면 다시 읽으세요)"
+
                 # 결과를 메시지에 추가
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call.id,
                     "name": function_name,
-                    "content": tool_result
+                    "content": condensed_result
                 })
 
         except Exception as e:
@@ -580,6 +665,12 @@ async def analyze_error(request: ErrorRequest):
                 "analysis": None
             }
 
+        # 에러 라인 번호 추출
+        error_line = None
+        if file_locations:
+            error_line = file_locations[0].get('line')
+            print(f"🎯 에러 라인 번호: {error_line}")
+
         # 2. AI 에이전트가 FastMCP 툴을 사용하며 분석
         print("\n🤖 AI 에이전트 분석 시작...")
         result = await _analyze_with_ai_agent(
@@ -587,6 +678,7 @@ async def analyze_error(request: ErrorRequest):
             error_message=request.error_message,
             stack_trace=request.stack_trace,
             file_locations=file_locations,
+            error_line=error_line,
             input_params=request.input_params,
             server_base_path=request.server_base_path
         )
@@ -608,7 +700,14 @@ async def analyze_error(request: ErrorRequest):
             print(f"{'='*60}")
         print(f"\n📊 툴 호출 내역:")
         for i, tc in enumerate(result['tool_calls'], 1):
-            print(f"  {i}. {tc['tool']}({tc['arguments']})")
+            args_str = str(tc['arguments'])
+            # error_line 사용 여부 표시
+            if tc['tool'] == 'read_file':
+                if 'error_line' in tc['arguments'] and tc['arguments']['error_line']:
+                    args_str += " ✅ (error_line 사용!)"
+                else:
+                    args_str += " ⚠️ (error_line 미사용 - 토큰 낭비!)"
+            print(f"  {i}. {tc['tool']}({args_str})")
 
         print(f"\n📝 분석 결과:")
         print(result["analysis"][:1000] + "..." if len(result["analysis"]) > 1000 else result["analysis"])
